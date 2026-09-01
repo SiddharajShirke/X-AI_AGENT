@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Runtime and secrets
+.env
+*.db
+*.sqlite
+*.sqlite3
+data/*
+!data/.gitkeep
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Packages
+*.zip
+build/
+dist/
+*.egg-info/

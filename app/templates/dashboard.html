@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+{% block content %}
+<section id="overview" class="panel hero">
+  <div>
+    <p class="eyebrow">CURRENT STARTUP CONTEXT</p>
+    <h2>{{ profile.name }}</h2>
+    <p class="lead">{{ profile.domain }}</p>
+    <p>{{ profile.brand_voice }}</p>
+  </div>
+  <div class="metrics">
+    <div><strong>{{ pending|length }}</strong><span>Pending review</span></div>
+    <div><strong>{{ published|length }}</strong><span>Published / dry-run</span></div>
+    <div><strong>{{ rejected|length }}</strong><span>Learning examples</span></div>
+    <div><strong>v{{ versions[0].version if versions else 1 }}</strong><span>Configuration</span></div>
+  </div>
+</section>
+
+<section class="flow panel">
+  <p class="eyebrow">END-TO-END LIFECYCLE</p>
+  <div class="flow-row">
+    <span>Schedule</span><b>→</b><span>Live context</span><b>→</b><span>Generate</span><b>→</b><span>Safety</span><b>→</b><span>Human review</span><b>→</b><span>Publish</span><b>→</b><span>Learn</span>
+  </div>
+  <p class="muted">Silence is never approval. Rejection or timeout is retained as negative memory and produces a different draft until the configured attempt limit.</p>
+</section>
+
+<section id="review" class="panel">
+  <div class="section-heading">
+    <div><p class="eyebrow">HUMAN APPROVAL</p><h2>Review queue</h2></div>
+    <form action="/ui/generate" method="post" class="inline-form">
+      <label>Context
+        <select name="context_id">
+          {% for context in contexts if context.enabled %}<option value="{{ context.id }}">{{ context.name }}</option>{% endfor %}
+        </select>
+      </label>
+      <button class="primary" type="submit">Generate a draft</button>
+    </form>
+  </div>
+  {% if not pending %}
+    <div class="empty">No pending drafts. Generate one, then Approve, Edit, or Reject it to demonstrate the complete loop.</div>
+  {% endif %}
+  <div class="draft-grid">
+  {% for draft in pending %}
+    <article class="draft-card" id="draft-{{ draft.id }}">
+      <div class="card-meta">
+        <span class="status pending">PENDING</span>
+        <span>Attempt {{ draft.attempt }}</span>
+        <span>Config v{{ draft.config_version }}</span>
+      </div>
+      <h3>{{ context_map[draft.context_id].name }}</h3>
+      <p class="post-text">{{ draft.text }}</p>
+      <p class="muted">Topic: {{ draft.topic }} · Similarity: {{ "%.0f"|format(draft.similarity_score * 100) }}%</p>
+      <div class="actions">
+        <form action="/ui/drafts/{{ draft.id }}/approve" method="post"><button class="approve" type="submit">Approve & publish</button></form>
+      </div>
+      <details>
+        <summary>Reject and teach the agent</summary>
+        <form action="/ui/drafts/{{ draft.id }}/reject" method="post" class="stacked-form danger-zone">
+          <label>Reason
+            <select name="reason">
+              <option value="too_generic">Too generic</option>
+              <option value="sounds_ai">Sounds AI-generated</option>
+              <option value="wrong_topic">Wrong topic</option>
+              <option value="too_promotional">Too promotional</option>
+              <option value="reveals_too_much">Reveals too much</option>
+              <option value="repetitive">Repetitive</option>
+              <option value="wrong_tone">Wrong tone</option>
+              <option value="other">Other</option>
+            </select>
+          </label>
+          <label>Human feedback<textarea name="notes" placeholder="Example: Use a concrete founder observation and avoid corporate wording."></textarea></label>
+          <button class="reject" type="submit">Reject + generate a new post</button>
+        </form>
+      </details>
+      <details>
+        <summary>Edit draft</summary>
+        <form action="/ui/drafts/{{ draft.id }}/edit" method="post" class="stacked-form">
+          <textarea name="text" maxlength="280" required>{{ draft.text }}</textarea>
+          <input name="notes" placeholder="What did you improve?">
+          <label class="check"><input type="checkbox" name="approve" value="yes"> Approve immediately after rechecking safety</label>
+          <button type="submit">Save human edit</button>
+        </form>
+      </details>
+    </article>
+  {% endfor %}
+  </div>
+</section>
+
+<section id="configuration" class="panel">
+  <p class="eyebrow">DYNAMIC AFTER DEPLOYMENT</p>
+  <h2>Startup profile</h2>
+  <p class="muted">Every save creates a new configuration version. The agent reloads the latest values for each generation.</p>
+  <form action="/ui/profile" method="post" class="form-grid">
+    <label>Startup name<input name="name" value="{{ profile.name }}" required></label>
+    <label>Domain<input name="domain" value="{{ profile.domain }}" required></label>
+    <label class="wide">Brand voice<input name="brand_voice" value="{{ profile.brand_voice }}" required></label>
+    <label>Target audience<textarea name="target_audience">{{ profile.target_audience|join('\n') }}</textarea></label>
+    <label>Problems discussed<textarea name="problems">{{ profile.problems|join('\n') }}</textarea></label>
+    <label>Public information<textarea name="public_info">{{ profile.public_info|join('\n') }}</textarea></label>
+    <label class="danger-label">Things never to reveal<textarea name="never_reveal">{{ profile.never_reveal|join('\n') }}</textarea><small>Use high-level categories or phrases. Do not paste credentials, source code, raw customer data, or a complete secret specification.</small></label>
+    <label>Content pillars<textarea name="content_pillars">{{ profile.content_pillars|join('\n') }}</textarea></label>
+    <label>Banned phrases<textarea name="banned_phrases">{{ profile.banned_phrases|join('\n') }}</textarea></label>
+    <label>Trend keywords<textarea name="trend_keywords">{{ profile.trend_keywords|join('\n') }}</textarea></label>
+    <label>Competitor accounts<textarea name="competitor_accounts">{{ profile.competitor_accounts|join('\n') }}</textarea></label>
+    <label class="wide">RSS feeds<textarea name="rss_feeds">{{ profile.rss_feeds|join('\n') }}</textarea></label>
+    <label>Timezone<input name="timezone" value="{{ profile.timezone }}"></label>
+    <label>Maximum attempts<input type="number" min="1" max="10" name="max_attempts" value="{{ profile.max_attempts }}"></label>
+    <label>Approval timeout (minutes)<input type="number" min="1" max="1440" name="approval_timeout_minutes" value="{{ profile.approval_timeout_minutes }}"></label>
+    <div class="wide"><button class="primary" type="submit">Save dynamic configuration</button></div>
+  </form>
+</section>
+
+<section id="slots" class="panel">
+  <p class="eyebrow">10 EDITABLE POSTING SLOTS</p>
+  <h2>Contexts and timers</h2>
+  <p class="muted">10 editable posting slots use {{ profile.timezone }}. A slot triggers once per local day.</p>
+  <div class="slot-grid">
+  {% for schedule in schedules %}
+    {% set context = context_map[schedule.context_id] %}
+    <article class="slot-card">
+      <div class="slot-number">{{ schedule.slot_number }}</div>
+      <form action="/ui/schedules/{{ schedule.id }}" method="post" class="stacked-form compact">
+        <label>Time<input type="time" name="time_local" value="{{ schedule.time_local }}"></label>
+        <label>Context<select name="context_id">{% for item in contexts %}<option value="{{ item.id }}" {% if item.id == schedule.context_id %}selected{% endif %}>{{ item.name }}</option>{% endfor %}</select></label>
+        <label class="check"><input type="checkbox" name="enabled" value="yes" {% if schedule.enabled %}checked{% endif %}> Enabled</label>
+        <button type="submit">Save timer</button>
+      </form>
+      <details>
+        <summary>Edit context instructions</summary>
+        <form action="/ui/contexts/{{ context.id }}" method="post" class="stacked-form compact">
+          <input name="name" value="{{ context.name }}" required>
+          <textarea name="purpose">{{ context.purpose }}</textarea>
+          <input name="tone" value="{{ context.tone }}">
+          <textarea name="instructions">{{ context.instructions }}</textarea>
+          <label class="check"><input type="checkbox" name="live_trends_required" value="yes" {% if context.live_trends_required %}checked{% endif %}> Use live trends</label>
+          <label class="check"><input type="checkbox" name="enabled" value="yes" {% if context.enabled %}checked{% endif %}> Context enabled</label>
+          <button type="submit">Save context</button>
+        </form>
+      </details>
+    </article>
+  {% endfor %}
+  </div>
+</section>
+
+<section id="learning" class="two-column">
+  <div class="panel">
+    <p class="eyebrow">LIVE CONTEXT</p><h2>Trend signals</h2>
+    <form action="/ui/trends" method="post" class="stacked-form">
+      <input name="title" placeholder="Signal title" required>
+      <textarea name="summary" placeholder="Brief, source-grounded summary" required></textarea>
+      <input name="source" value="manual" placeholder="Source">
+      <input name="url" placeholder="Optional source URL">
+      <button type="submit">Add signal</button>
+    </form>
+    <div class="list">
+      {% for trend in trends %}<div><strong>{{ trend.title }}</strong><p>{{ trend.summary }}</p><small>{{ trend.source }}</small></div>{% else %}<p class="muted">Configured keywords produce demo signals automatically.</p>{% endfor %}
+    </div>
+  </div>
+  <div class="panel">
+    <p class="eyebrow">SELF-IMPROVING MEMORY</p><h2>Learned preferences</h2>
+    <div class="list">
+      {% for preference in preferences %}<div><strong>Weight {{ "%.2f"|format(preference.weight) }}</strong><p>{{ preference.rule }}</p></div>{% else %}<p class="muted">Reject or edit a draft to create durable preferences.</p>{% endfor %}
+    </div>
+  </div>
+</section>
+
+<section id="activity" class="two-column">
+  <div class="panel"><p class="eyebrow">HISTORY</p><h2>Recent drafts</h2><div class="list compact-list">{% for draft in drafts[:15] %}<div><span class="status {{ draft.status }}">{{ draft.status }}</span><p>{{ draft.text }}</p><small>{{ draft.created_at }} · attempt {{ draft.attempt }}</small></div>{% endfor %}</div></div>
+  <div class="panel"><p class="eyebrow">AUDIT TRAIL</p><h2>Events</h2><div class="list compact-list">{% for event in events %}<div><strong>{{ event.event_type }}</strong><small>{{ event.created_at }}</small></div>{% else %}<p class="muted">Events appear as the workflow runs.</p>{% endfor %}</div></div>
+</section>
+{% endblock %}

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "startup-x-agent-codex-prototype"
+version = "0.1.0"
+description = "Human-in-the-loop, self-improving startup X agent prototype"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "jinja2>=3.1,<4",
+  "python-multipart>=0.0.9,<1",
+  "pydantic-settings>=2.7,<3",
+  "httpx>=0.27,<1",
+  "groq>=1.5,<2",
+  "tweepy>=4.14,<5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-cov>=5,<8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["app*"]

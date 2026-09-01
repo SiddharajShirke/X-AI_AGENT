@@ -1,0 +1,4 @@
+# Example only. Keep repository behavior in AGENTS.md and task skills.
+# Start Codex from the repository root so it can discover AGENTS.md.
+# Model selection is intentionally omitted: choose a Codex model available
+# in your own Codex environment and organization.

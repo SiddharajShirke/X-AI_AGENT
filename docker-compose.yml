@@ -1,0 +1,14 @@
+services:
+  x-agent:
+    build: .
+    container_name: startup-x-agent-prototype
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - x_agent_data:/data
+    restart: unless-stopped
+
+volumes:
+  x_agent_data:
