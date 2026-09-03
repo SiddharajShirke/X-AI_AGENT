@@ -19,7 +19,6 @@ def _runtime(database_path: str):
         groq_api_key="",
         telegram_bot_token="",
         telegram_chat_id="",
-        slack_webhook_url="",
     )
     database = Database(settings.database_path)
     database.initialize()
@@ -39,45 +38,93 @@ def main(argv: list[str] | None = None) -> int:
 
     _, repository, services = _runtime(args.database_path)
     if args.command == "seed":
-        if not repository.list_trends():
+        account = repository.list_accounts()[0]
+        if not repository.list_trends(account.id):
             repository.add_trend(
+                account.id,
                 title="Teams are discussing reliable agent handoffs",
                 summary="A sample signal about visibility, handoffs, and human control.",
                 source="seed-demo",
             )
         print(f"Seeded {args.database_path}")
-        print("10 schedule slots and 10 content contexts are ready.")
+        print(f"Account @{account.handle} has 10 schedule slots and 10 content contexts ready.")
         return 0
 
     if args.command == "show-state":
-        profile = repository.get_profile()
-        state = {
-            "startup": profile.name,
-            "domain": profile.domain,
-            "configuration_version": repository.current_config_version(),
-            "contexts": len(repository.list_contexts()),
-            "schedule_slots": len(repository.list_schedules()),
-            "drafts": len(repository.list_drafts()),
-            "learned_preferences": len(repository.list_preferences()),
-        }
+        state = []
+        for account in repository.list_accounts():
+            profile = repository.get_profile(account.id)
+            state.append(
+                {
+                    "x_account_id": account.id,
+                    "handle": account.handle,
+                    "startup": profile.name,
+                    "domain": profile.domain,
+                    "configuration_version": repository.current_config_version(account.id),
+                    "contexts": len(repository.list_contexts(account.id)),
+                    "schedule_slots": len(repository.list_schedules(account.id)),
+                    "drafts": len(repository.list_drafts(account.id)),
+                    "learned_preferences": len(repository.list_preferences(account.id)),
+                }
+            )
         print(json.dumps(state, indent=2))
         return 0
 
-    first = services.pipeline.generate_draft(context_id=1)
-    print(f"1. Generated: {first.text}")
-    second = services.pipeline.reject_and_regenerate(
+    accounts = repository.list_accounts()
+    account_one = accounts[0]
+    account_two = next((item for item in accounts[1:] if item.handle == "demo_second"), None)
+    if account_two is None:
+        account_two = repository.create_account(
+            "Demo Account 2",
+            "demo_second",
+            "UTC",
+            copy_from_id=account_one.id,
+        )
+    repository.update_profile(
+        account_one.id, {"domain": "Founder workflow reliability"}
+    )
+    repository.update_profile(
+        account_two.id, {"domain": "Independent market research"}
+    )
+
+    first_context = repository.list_contexts(account_one.id)[0]
+    first = services.pipeline.generate_draft(
+        account_one.id, context_id=first_context.id
+    )
+    print(f"Account 1 (@{account_one.handle}): generated {first.text}")
+    replacement = services.pipeline.reject_and_regenerate(
+        account_one.id,
         first.id,
         reason="too_generic",
         notes="Use a different, concrete founder observation.",
         reviewer="cli-demo-human",
     )
-    if second is None:
+    if replacement is None:
         raise RuntimeError("Demo unexpectedly reached the attempt limit")
-    print(f"2. Rejected and learned. Replacement: {second.text}")
-    published = services.pipeline.approve(second.id, reviewer="cli-demo-human")
-    print(f"3. Approved: status={published.status}, provider={published.publisher_provider}")
-    print(f"4. Demo URL: {published.post_url}")
-    print(f"5. Learned rules: {len(repository.list_preferences())}")
+    print(f"Account 1: rejected and learned; replacement {replacement.text}")
+
+    account_two_rejected = services.feedback_engine.memory_bundle(account_two.id)[1]
+    if first.text in account_two_rejected or repository.list_feedback(account_two.id):
+        raise RuntimeError("Cross-account learning isolation failed")
+    print("Account 2: isolation verified; Account 1 feedback is absent")
+
+    published_one = services.pipeline.approve(
+        account_one.id, replacement.id, reviewer="cli-demo-human"
+    )
+    second_context = repository.list_contexts(account_two.id)[0]
+    second_draft = services.pipeline.generate_draft(
+        account_two.id, context_id=second_context.id
+    )
+    published_two = services.pipeline.approve(
+        account_two.id, second_draft.id, reviewer="cli-demo-human"
+    )
+    print(
+        f"Account 1: status={published_one.status}, provider={published_one.publisher_provider}"
+    )
+    print(
+        f"Account 2 (@{account_two.handle}): status={published_two.status}, provider={published_two.publisher_provider}"
+    )
+    print("Both publications required explicit cli-demo-human approval actions.")
     return 0
 
 

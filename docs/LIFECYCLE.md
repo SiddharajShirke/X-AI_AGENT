@@ -1,45 +1,16 @@
 # End-to-end lifecycle
 
-## 1. Trigger
+1. A manual action or an enabled account schedule selects an `x_account_id` and context. Schedule times are interpreted in that account's timezone.
+2. The Pipeline loads only that account's latest profile, contexts, trends, approved/rejected examples, and learned preferences.
+3. Groq or the credential-free demo writer creates candidates. `never_reveal`, banned-language, length, and similarity checks run before a draft can become `pending`.
+4. The pending draft appears on the account dashboard and, when bound, its Slack channel. A notification is not approval.
+5. The human chooses one action:
+   - **Approve:** safety runs again, the draft is atomically claimed, and one publisher call occurs.
+   - **Reject:** the original and reason remain in history; a materially different child draft is generated while attempts remain.
+   - **Edit:** the original remains, the edit is checked, and a child draft is created. Checking “approve” is an explicit approval in the same authenticated submission.
+6. Publication is dry-run unless both live switches are on. In live mode, the account's decrypted Buffer key and channel are used for that call only.
+7. A failed live publication remains `failed` and needs an explicit Retry. Published drafts cannot retry.
+8. Timeout becomes `expired`, records a timeout lesson, and may create a replacement. It never calls a publisher.
+9. At the account's attempt limit, regeneration stops at `needs_guidance`.
 
-A manual dashboard action or an enabled schedule reaches its configured local `HH:MM`. The scheduler checks `last_run_date`, so the same slot runs once per local day.
-
-## 2. Dynamic context load
-
-The pipeline loads the latest profile, context, schedule, configuration version, approved examples, rejected examples, and weighted preferences. The process does not rely on values cached at server startup.
-
-## 3. Current context collection
-
-For contexts marked “live trends required,” the collector merges manual signals, optional X recent-search snippets, optional RSS entries, and safe demo signals. Competitor information is one-way market intelligence; private startup context is not sent to competitors or inserted into search queries.
-
-## 4. Draft generation
-
-The writer receives only safe public startup context plus the absolute prohibition list. It must choose one angle, avoid unverifiable claims, stay under 280 characters, and return only the post.
-
-## 5. Safety and uniqueness
-
-The deterministic safety guard checks never-reveal phrases, suspicious overlap, banned wording, emptiness, and length. The similarity guard compares the candidate with recent pending, rejected, expired, approved, and published text. Multiple internal candidates may be attempted; an unsafe or duplicate candidate never enters the review queue.
-
-## 6. Human review
-
-A pending draft is shown in the dashboard and optionally sent to Telegram and Slack. Silence is not approval.
-
-### Approve
-
-The pipeline re-runs safety, records the reviewer, calls the selected publisher, stores the provider and URL, records a positive example, and sends a status notification.
-
-### Reject
-
-The original draft is retained. The feedback engine maps the reason code and written note to reusable rules. If attempts remain, a child draft is generated with the rejected text and new rules in context. Similarity protection forces a materially different candidate.
-
-### Edit
-
-The edit is rechecked for disclosure and repetition. A safe edit becomes a child draft, preserving the original and the before/after learning signal. It can remain pending or be explicitly approved.
-
-### No response
-
-After the configured timeout, the draft becomes expired, a timeout lesson is stored, and a replacement is generated. No publisher is called.
-
-## 7. Stop condition
-
-When the attempt limit is reached, status becomes `needs_guidance`. The system waits for a human to change context, edit manually, or start a new chain.
+Dashboard actions use HTTP Basic identity plus CSRF. Slack actions use the Slack user identity only after HMAC verification, timestamp validation, connection/account binding validation, and draft/account validation. Repeated callbacks are idempotent at the publication claim.

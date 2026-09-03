@@ -56,8 +56,6 @@ def _buffer_settings(**overrides):
         scheduler_enabled=False,
         groq_api_key="",
         buffer_live_posting=True,
-        buffer_api_key="test-buffer-api-key",
-        buffer_channel_id="chan-abc",
         buffer_api_url="https://api.buffer.com",
         buffer_share_mode="shareNow",
     )
@@ -252,7 +250,7 @@ def test_buffer_publisher_sends_authorization_bearer_header(repository):
     from app.services.publishers import BufferPublisher
 
     requests: list[httpx.Request] = []
-    settings = _buffer_settings(buffer_api_key="test-buffer-api-key")
+    settings = _buffer_settings()
     draft = _make_draft(repository)
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -292,7 +290,7 @@ def test_buffer_publisher_sends_correct_variables(repository):
     from app.services.publishers import BufferPublisher
 
     requests: list[httpx.Request] = []
-    settings = _buffer_settings(buffer_channel_id="chan-abc", buffer_share_mode="shareNow")
+    settings = _buffer_settings(buffer_share_mode="shareNow")
     draft = _make_draft(repository)
 
     def handler(request: httpx.Request) -> httpx.Response:

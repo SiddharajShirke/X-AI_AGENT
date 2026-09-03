@@ -1,48 +1,21 @@
-# Colleague demonstration script
+# Demo script
 
-## Preparation
+Run:
 
-1. Copy `.env.example` to `.env`.
-2. Change `ADMIN_PASSWORD`.
-3. Leave OpenAI, Telegram, Slack, and X credentials blank for the first demo.
-4. Start with `docker compose up --build` or `scripts/start_local.ps1`.
+```powershell
+.\.venv\Scripts\python.exe scripts\demo_flow.py
+```
 
-## Seven-minute walkthrough
+The credential-free script creates two X account workspaces, assigns different domains, rejects and regenerates under Account 1, verifies Account 2 received none of Account 1's feedback, and explicitly approves one dry-run draft for each account.
 
-### Minute 1 — Explain the safety boundary
+For a browser demonstration:
 
-Open **Startup profile**. Show public information and **Things never to reveal**. Explain that the agent talks around the startup’s domain, not about its hidden implementation.
+1. Start the app and open **Accounts**.
+2. Add a second account using **Copy settings from**.
+3. Open each account and show separate review/history data.
+4. Use Setup to bind different Buffer channel IDs and Slack channels, or reuse the same saved connections.
+5. Generate and reject a draft under Account 1; confirm Account 2 learning is unchanged.
+6. Approve a replacement in dry-run mode.
+7. After a test Slack connection is configured, demonstrate signed Slack reject and approval actions.
 
-### Minute 2 — Show dynamic configuration
-
-Change the domain, audience, and brand voice. Save. Point out the configuration version increase and explain that no code or redeployment was needed.
-
-### Minute 3 — Show the ten contexts and times
-
-Open **10 posting slots**. Change a time and edit the context instructions. Explain that every slot can use a different content purpose and can be disabled.
-
-### Minute 4 — Generate
-
-Choose a context and press **Generate a draft**. Show the pending state, context, attempt, source summary, and similarity score. Explain that no publication happened.
-
-### Minute 5 — Reject and teach
-
-Choose **Too generic**, add “Use a specific founder observation and avoid corporate language,” then reject. Show:
-
-- the original in history;
-- a new child draft;
-- attempt increment;
-- different wording and angle;
-- new learned preference rules.
-
-### Minute 6 — Approve
-
-Approve the replacement. Show the `published` state and dry-run provider. Explain that real X remains locked behind an explicit environment flag and credentials.
-
-### Minute 7 — Show no-response behavior
-
-Explain the configurable timeout: silence expires a draft and produces another candidate; it never becomes implicit approval. Show the event log and lifecycle document.
-
-## Optional integrations
-
-Repeat with OpenAI generation, Telegram buttons, Slack notification, and direct X posting only after the offline workflow has been demonstrated safely.
+Do not enable live Buffer posting until a disposable test X channel and exact final text have been verified.

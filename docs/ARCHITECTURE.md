@@ -1,67 +1,49 @@
 # Architecture
 
-## Design objective
+## Objective
 
-The prototype makes every important decision visible: what context was loaded, what draft was generated, what safety and similarity checks ran, what the human decided, what lesson was stored, and whether publishing occurred.
-
-## Component diagram
+One trusted operator can manage two or three independent X account workspaces in one FastAPI process and SQLite database. Account separation is explicit in every repository and Pipeline call; this is account-scoped data isolation inside one application, not hostile multi-tenant isolation.
 
 ```text
-┌─────────────────────────────────────────────────────────────────────┐
-│ Admin dashboard                                                     │
-│ profile • never reveal • trends • competitors • contexts • timers  │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               ▼
-                     ┌────────────────────┐
-                     │ SQLite repository  │
-                     │ config + history   │
-                     └─────────┬──────────┘
-                               ▼
-┌───────────┐       ┌────────────────────┐       ┌──────────────────┐
-│ Scheduler │──────►│ Pipeline           │◄──────│ Feedback memory  │
-└───────────┘       └─────────┬──────────┘       └──────────────────┘
-                              │
-              ┌───────────────┼────────────────┐
-              ▼               ▼                ▼
-      Trend collector   Content generator   Safety guard
-   manual/RSS/X/demo    OpenAI/demo writer  + similarity
-              └───────────────┬────────────────┘
-                              ▼
-                    Pending review draft
-                              │
-              ┌───────────────┼──────────────────┐
-              ▼               ▼                  ▼
-          Dashboard        Telegram             Slack
-              │               │                  │
-              └───────────────┼──────────────────┘
-                              ▼
-                    Explicit human action
-                    approve / reject / edit
-                              │
-              ┌───────────────┴─────────────────┐
-              ▼                                 ▼
-       Publisher manager                  Feedback engine
-     dry-run / direct X                 examples + rules
+Accounts dashboard / account setup / signed Slack action
+                         |
+                         v
+                  account-scoped routes
+                         |
+                         v
+          Pipeline (generation and lifecycle sequencing)
+             /            |                 \
+      account data   notifier manager   publisher manager
+          |          resolves Slack      per-call Buffer target
+          |                 |                 |
+          +---------- SQLite repository -----+
+                     encrypted credentials
 ```
 
-## Dependency direction
+## Boundaries
 
-Routes call services; services call the repository or adapters; adapters do not call routes. `Pipeline` owns business sequencing. `Repository` owns SQLite details. This allows a later production version to replace SQLite, notifications, generation, or publishing without changing the lifecycle contract.
+- `app/repository.py` persists account-owned rows and performs the atomic publication claim/completion transactions.
+- `app/services/pipeline.py` sequences generation, safety, review, feedback, timeout, and publication.
+- `app/services/integrations.py` encrypts/decrypts reusable Buffer and Slack connections, resolves account bindings, tests connections, and verifies Slack signatures.
+- `app/services/notifiers.py` resolves Slack for the current account on every notification. Console remains credential-free; Telegram is optional.
+- `app/services/publishers.py` receives decrypted Buffer credentials only for one call. It never stores them in results or the manager.
+- `app/routes/` validates transport concerns. Dashboard/API/Slack all call the same Pipeline transitions.
 
-## Core invariants
+## Account ownership
 
-- Draft creation and publication are separate actions.
-- Only `pending` drafts can be approved or rejected.
-- Only explicit approval calls the publisher.
-- Safety is checked at generation and again immediately before publishing.
-- Rejected and expired drafts remain queryable.
-- A replacement links to its parent and increments the attempt.
-- Learned rules never override `never_reveal`.
-- Attempt limits stop automatic loops.
+`x_account_id` scopes profiles, contexts, schedules, trends, drafts, feedback, preferences, event logs, integration bindings, and publication attempts. Composite foreign keys prevent a child row from referencing another account's parent. Copying an account copies only profile/context/schedule configuration.
+
+Reusable `integration_connections` contain Fernet-encrypted provider credentials. `account_integrations` bind a connection to an account and carry the account-specific target, such as a Buffer channel ID. Therefore one Buffer login may target two different X channels, while another account may use a separate login.
+
+## Publication concurrency
+
+Approval first performs a conditional SQLite update from `pending` to `publishing` and inserts a publication-attempt row in the same transaction. Only the winner calls Buffer. Repeated or overlapping approvals observe the existing state. A retry claims only `failed` and requires a new explicit action.
 
 ## Adapter selection
 
-- Generation: OpenAI when a key is present; otherwise `DemoWriter`.
-- Publication: direct X only when explicitly enabled and credentials are complete; otherwise `DryRunPublisher`.
-- Notification: console always; Telegram and Slack when configured.
-- Trends: stored/manual first, optional X and RSS next, demo signals when none exist.
+- Generation: Groq when configured; deterministic demo writer otherwise.
+- Publishing: dry-run unless both the global Buffer flag and account live flag are enabled. When both are enabled, a missing/locked Buffer binding is a visible failure.
+- Review delivery: dashboard always, account-bound Slack when configured, optional Telegram.
+- Trends: stored/manual, optional RSS/X, then demo signals when none exist.
+
+The scheduler is single-process and SQLite-backed. Horizontal scaling and distributed scheduling are outside this prototype.

@@ -1,25 +1,30 @@
 # Security and prototype limitations
 
+## Implemented safeguards
+
+- Every lifecycle record and integration binding is account-scoped.
+- Dashboard forms use HTTP Basic identity and signed CSRF tokens.
+- Slack callbacks require the provider signature, a timestamp within five minutes, the account's bound connection, and an account-owned draft.
+- Buffer and Slack credentials are Fernet-encrypted with `APP_ENCRYPTION_KEY`; UI/API responses show only a configured mask.
+- Publication has an atomic claim, so repeated or overlapping approvals produce one publisher call.
+- Global and per-account live switches default off. Missing credentials in live mode are failures, not dry-run success.
+- The deprecated compatibility setting `X_LIVE_POSTING` remains false and cannot enable publishing; `BUFFER_LIVE_POSTING` is the effective global gate.
+- Safety is checked again immediately before approval/retry. Silence is never approval.
+
 ## Deliberately prototype-level
 
-- HTTP Basic authentication rather than SSO.
-- SQLite rather than a managed relational database.
-- In-process timer rather than a durable distributed job queue.
-- Deterministic phrase/overlap safety rather than enterprise DLP.
-- Direct outbound HTTP integrations with basic retry behavior.
-- Text-only X publication.
-- No multi-tenant isolation.
+- One trusted operator and HTTP Basic authentication; no SSO, roles, or hostile tenant boundary.
+- SQLite and one in-process scheduler; no distributed queue or leader election.
+- Application-managed encryption with one environment key; no managed key vault or rotation workflow.
+- Deterministic disclosure/style checks rather than enterprise DLP.
+- Text-only Buffer publication without provider reconciliation, media, or threads.
+- Direct outbound webhooks with limited retry handling.
+- No automated backup, monitoring, retention policy, or disaster recovery.
 
-## Before production
+Keep `.env`, SQLite files, and backups private. If `APP_ENCRYPTION_KEY` is lost, saved integrations cannot be recovered. Never paste API keys, source code, raw customer data, legal secrets, or a complete unreleased specification into startup content fields. `never_reveal` should contain high-level prohibited topics or recognizable phrases.
 
-Add identity and roles, CSRF protection for form actions, encrypted secrets, managed Postgres, durable queues, scheduler leader election, idempotency keys, rate-limit handling, provider reconciliation, structured audit retention, backups, monitoring, alerting, content provenance, legal review, and adversarial safety testing.
+Groq receives configured safe/public context and prohibition instructions when enabled, and output is checked locally. X/RSS text is untrusted reference material. Organizations with stricter boundaries need an approved private model and DLP architecture.
 
-## Content responsibility
+A responsible human remains accountable for accuracy, confidentiality, intellectual property, X/Buffer rules, and posting frequency.
 
-The system is a drafting and workflow tool. A responsible human remains accountable for accuracy, confidentiality, intellectual property, platform rules, and whether ten daily posts are appropriate for the audience.
-
-## Handling confidential startup information
-
-Use the dynamic `never_reveal` field for high-level categories and recognizable phrases that must be blocked. Do not store credentials, source code, raw customer records, legal secrets, or the complete unreleased product specification in this prototype. When `OPENAI_API_KEY` is enabled, the configured safe context and prohibition rules are sent to the selected OpenAI model as generation instructions; the generated text is then checked locally again. Organizations with stricter data-boundary requirements should replace this design with an approved private model/DLP architecture before entering sensitive material.
-
-X and RSS text is treated as untrusted reference data. The prompt tells the writer to ignore instructions embedded in those sources, but production use still requires stronger prompt-injection testing and source sanitization.
+WhatsApp is not implemented. When added, it should verify provider identity and call the same account-scoped Pipeline; it must not bypass or duplicate approval state.

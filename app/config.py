@@ -49,10 +49,10 @@ class Settings(BaseSettings):
 
     # ---------------------------------------------------------------------------
     # Buffer publishing
+    # Credentials and channel targets are stored encrypted in SQLite.
     # ---------------------------------------------------------------------------
+    x_live_posting: bool = False
     buffer_live_posting: bool = False
-    buffer_api_key: str = ""
-    buffer_channel_id: str = ""
     buffer_api_url: str = "https://api.buffer.com"
     buffer_timeout_seconds: float = Field(default=30.0, ge=5.0, le=120.0)
     buffer_share_mode: str = "shareNow"
@@ -63,7 +63,6 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_webhook_secret: str = ""
-    slack_webhook_url: str = ""
 
     rss_timeout_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
     max_generation_candidates: int = Field(default=5, ge=2, le=12)
@@ -85,10 +84,3 @@ class Settings(BaseSettings):
         if self.database_path == ":memory:":
             return None
         return Path(self.database_path).expanduser().resolve().parent
-
-    @property
-    def has_buffer_credentials(self) -> bool:
-        return bool(
-            self.buffer_api_key.strip()
-            and self.buffer_channel_id.strip()
-        )

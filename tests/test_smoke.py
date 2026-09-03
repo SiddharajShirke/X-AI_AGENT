@@ -43,7 +43,7 @@ def test_application_assets_resolve_outside_repository_working_directory(
     assert app.title == settings.app_name
 
 
-def test_documented_demo_script_runs_from_repository_root():
+def test_documented_demo_script_runs_two_independent_accounts():
     root = Path(__file__).resolve().parents[1]
 
     result = subprocess.run(
@@ -56,5 +56,7 @@ def test_documented_demo_script_runs_from_repository_root():
     )
 
     assert result.returncode == 0, result.stderr
-    assert "Rejected and learned" in result.stdout
+    assert "Account 1" in result.stdout
+    assert "Account 2" in result.stdout
+    assert "isolation verified" in result.stdout
     assert "status=published" in result.stdout

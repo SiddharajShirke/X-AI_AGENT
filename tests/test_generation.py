@@ -152,8 +152,6 @@ def _make_settings_with_groq(model: str = "openai/gpt-oss-120b"):
         groq_api_key="test-groq-key",
         groq_model=model,
         buffer_live_posting=False,
-        buffer_api_key="",
-        buffer_channel_id="",
     )
 
 

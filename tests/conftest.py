@@ -17,12 +17,9 @@ def settings(tmp_path: Path):
         admin_password="demo-pass",
         scheduler_enabled=False,
         buffer_live_posting=False,
-        buffer_api_key="",
-        buffer_channel_id="",
         groq_api_key="",
         telegram_bot_token="",
         telegram_chat_id="",
-        slack_webhook_url="",
     )
 
 
