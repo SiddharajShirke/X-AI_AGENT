@@ -26,3 +26,6 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+
+# Local isolated implementation worktrees
+.worktrees/
