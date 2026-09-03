@@ -15,6 +15,8 @@ from app.models import (
     FeedbackRecord,
     IntegrationConnection,
     LearnedPreference,
+    PublishAttempt,
+    PublishResult,
     ScheduleSlot,
     StartupProfile,
     TrendItem,
@@ -150,6 +152,10 @@ def _binding_from_row(row: Any) -> AccountIntegration:
         last_test_error=row["last_test_error"],
         last_tested_at=row["last_tested_at"],
     )
+
+
+def _publish_attempt_from_row(row: Any) -> PublishAttempt:
+    return PublishAttempt(**dict(row))
 
 
 class Repository:
@@ -848,6 +854,120 @@ class Repository:
                 (x_account_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def claim_publish(
+        self,
+        x_account_id: int,
+        draft_id: str,
+        *,
+        reviewer: str,
+        origin: str,
+        allow_retry: bool = False,
+    ) -> tuple[Draft, PublishAttempt] | None:
+        now = utc_now_iso()
+        with self.database.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE drafts
+                SET status = 'publishing', reviewer = ?,
+                    approved_at = COALESCE(approved_at, ?), expires_at = NULL
+                WHERE x_account_id = ?
+                  AND id = ?
+                  AND (status = 'pending' OR (? = 1 AND status = 'failed'))
+                """,
+                (reviewer, now, x_account_id, str(draft_id), int(allow_retry)),
+            )
+            if cursor.rowcount != 1:
+                return None
+            attempt_number = int(
+                conn.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt_number), 0) + 1
+                    FROM publish_attempts
+                    WHERE x_account_id = ? AND draft_id = ?
+                    """,
+                    (x_account_id, str(draft_id)),
+                ).fetchone()[0]
+            )
+            attempt_cursor = conn.execute(
+                """
+                INSERT INTO publish_attempts (
+                    x_account_id, draft_id, attempt_number, status, origin,
+                    reviewer, error, created_at, completed_at
+                ) VALUES (?, ?, ?, 'publishing', ?, ?, '', ?, NULL)
+                """,
+                (
+                    x_account_id,
+                    str(draft_id),
+                    attempt_number,
+                    origin,
+                    reviewer,
+                    now,
+                ),
+            )
+            draft_row = conn.execute(
+                "SELECT * FROM drafts WHERE x_account_id = ? AND id = ?",
+                (x_account_id, str(draft_id)),
+            ).fetchone()
+            attempt_row = conn.execute(
+                "SELECT * FROM publish_attempts WHERE id = ?",
+                (attempt_cursor.lastrowid,),
+            ).fetchone()
+        return _draft_from_row(draft_row), _publish_attempt_from_row(attempt_row)
+
+    def complete_publish(
+        self,
+        x_account_id: int,
+        draft_id: str,
+        attempt_id: int,
+        result: PublishResult,
+    ) -> Draft:
+        completed_at = utc_now_iso()
+        final_status = "published" if result.success else "failed"
+        with self.database.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE publish_attempts
+                SET status = ?, error = ?, completed_at = ?
+                WHERE id = ? AND x_account_id = ? AND draft_id = ?
+                  AND status = 'publishing'
+                """,
+                (
+                    final_status,
+                    result.error,
+                    completed_at,
+                    attempt_id,
+                    x_account_id,
+                    str(draft_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Publication attempt is not active for this account draft")
+            draft_cursor = conn.execute(
+                """
+                UPDATE drafts
+                SET status = ?, published_at = ?, publisher_provider = ?,
+                    external_post_id = ?, post_url = ?, error = ?
+                WHERE x_account_id = ? AND id = ? AND status = 'publishing'
+                """,
+                (
+                    final_status,
+                    completed_at if result.success else None,
+                    result.provider,
+                    result.external_post_id,
+                    result.post_url,
+                    result.error,
+                    x_account_id,
+                    str(draft_id),
+                ),
+            )
+            if draft_cursor.rowcount != 1:
+                raise RuntimeError("Draft is not awaiting publication completion")
+            row = conn.execute(
+                "SELECT * FROM drafts WHERE x_account_id = ? AND id = ?",
+                (x_account_id, str(draft_id)),
+            ).fetchone()
+        return _draft_from_row(row)
 
     def create_integration_connection(
         self, provider: str, label: str, encrypted_credentials: str

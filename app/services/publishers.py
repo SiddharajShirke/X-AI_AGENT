@@ -5,7 +5,8 @@ import logging
 import httpx
 
 from app.config import Settings
-from app.models import Draft, PublishResult
+from app.models import Draft, PublishResult, XAccount
+from app.services.integrations import BufferTarget
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +66,12 @@ class BufferPublisher:
     def __init__(
         self,
         settings: Settings,
+        target: BufferTarget,
         client: httpx.Client | None = None,
     ):
         self.settings = settings
+        self._api_key = target.api_key
+        self._channel_id = target.channel_id
         self._client = client or httpx.Client(
             timeout=settings.buffer_timeout_seconds,
         )
@@ -76,7 +80,7 @@ class BufferPublisher:
         variables = {
             "input": {
                 "text": draft.text,
-                "channelId": self.settings.buffer_channel_id,
+                "channelId": self._channel_id,
                 "schedulingType": "automatic",
                 "mode": self.settings.buffer_share_mode,
                 "aiAssisted": True,
@@ -89,7 +93,7 @@ class BufferPublisher:
             "variables": variables,
         }
         headers = {
-            "Authorization": f"Bearer {self.settings.buffer_api_key}",
+            "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
         url = self.settings.buffer_api_url.rstrip("/")
@@ -199,24 +203,26 @@ class BufferPublisher:
 
 
 class PublisherManager:
-    """Selects the appropriate publisher based on runtime settings.
+    """Publish with the selected account's Buffer target or safe dry-run mode."""
 
-    Selection logic:
-    - buffer_live_posting=True AND has_buffer_credentials → BufferPublisher
-    - All other cases → DryRunPublisher (safe default)
-
-    There is no direct X publishing path in this module. Publishing is handled
-    exclusively via the Buffer API when live mode is enabled.
-    TWITTER_BEARER_TOKEN is unrelated and used only for trend research
-    in app/services/trends.py.
-    """
-
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, client: httpx.Client | None = None):
         self.settings = settings
-        if settings.buffer_live_posting and settings.has_buffer_credentials:
-            self.publisher: DryRunPublisher | BufferPublisher = BufferPublisher(settings)
-        else:
-            self.publisher = DryRunPublisher()
+        self._client = client
 
-    def publish(self, draft: Draft) -> PublishResult:
-        return self.publisher.publish(draft)
+    def publish(
+        self,
+        draft: Draft,
+        account: XAccount,
+        target: BufferTarget | None,
+    ) -> PublishResult:
+        if not self.settings.buffer_live_posting or not account.live_posting_enabled:
+            return DryRunPublisher().publish(draft)
+        if target is None:
+            return PublishResult(
+                success=False,
+                provider="buffer",
+                error="Buffer connection is missing or disabled for this X account",
+            )
+        return BufferPublisher(
+            self.settings, target, client=self._client
+        ).publish(draft)

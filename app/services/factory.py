@@ -45,6 +45,7 @@ def build_services(settings: Settings, repository: Repository) -> Services:
         safety,
         similarity,
         feedback,
+        integrations,
         notifiers,
         publishers,
     )

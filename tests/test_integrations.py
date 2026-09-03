@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from app.services.notifiers import NotifierManager, SlackNotifier, TelegramNotifier
+from app.services.integrations import BufferTarget
 from app.services.publishers import DryRunPublisher
 
 
@@ -64,9 +65,18 @@ def _buffer_settings(**overrides):
     return Settings(**base)
 
 
+def _buffer_target(
+    *, api_key: str = "test-buffer-api-key", channel_id: str = "chan-abc"
+) -> BufferTarget:
+    return BufferTarget(api_key=api_key, channel_id=channel_id)
+
+
 def _make_draft(repository) -> Any:
+    account = repository.list_accounts()[0]
+    context = repository.list_contexts(account.id)[0]
     return repository.create_draft(
-        context_id=1,
+        account.id,
+        context_id=context.id,
         schedule_id=None,
         text="A startup post about reliable AI.",
         topic="reliability",
@@ -76,7 +86,7 @@ def _make_draft(repository) -> Any:
         similarity_score=0.1,
         attempt=1,
         parent_draft_id=None,
-        config_version=repository.current_config_version(),
+        config_version=repository.current_config_version(account.id),
         expires_at=None,
         generator_provider="demo",
         prompt_snapshot="",
@@ -108,8 +118,11 @@ def test_notifier_manager_wires_telegram_settings_in_correct_order(settings):
 def test_telegram_review_message_contains_explicit_approve_and_reject_actions(repository):
     requests: list[httpx.Request] = []
     client = _capturing_client([{"ok": True}], requests)
+    account = repository.list_accounts()[0]
+    context = repository.list_contexts(account.id)[0]
     draft = repository.create_draft(
-        context_id=1,
+        account.id,
+        context_id=context.id,
         schedule_id=None,
         text="A specific founder observation.",
         topic="reliability",
@@ -119,7 +132,7 @@ def test_telegram_review_message_contains_explicit_approve_and_reject_actions(re
         similarity_score=0.1,
         attempt=1,
         parent_draft_id=None,
-        config_version=repository.current_config_version(),
+        config_version=repository.current_config_version(account.id),
         expires_at=None,
         generator_provider="demo",
         prompt_snapshot="",
@@ -128,23 +141,27 @@ def test_telegram_review_message_contains_explicit_approve_and_reject_actions(re
 
     result = notifier.notify_for_review(
         draft,
-        repository.get_profile(),
-        repository.get_context(1),
+        account,
+        repository.get_profile(account.id),
+        context,
     )
 
     assert result.success is True
     payload = json.loads(requests[0].content)
     buttons = payload["reply_markup"]["inline_keyboard"][0]
-    assert buttons[0]["callback_data"] == f"approve:{draft.id}"
-    assert buttons[1]["callback_data"] == f"reject:{draft.id}"
+    assert buttons[0]["callback_data"] == f"approve:{account.id}:{draft.id}"
+    assert buttons[1]["callback_data"] == f"reject:{account.id}:{draft.id}"
     assert "Nothing is published until Approve is pressed" in payload["text"]
 
 
 def test_slack_review_message_points_to_human_dashboard(repository):
     requests: list[httpx.Request] = []
     client = _capturing_client([{}], requests)
+    account = repository.list_accounts()[0]
+    context = repository.list_contexts(account.id)[1]
     draft = repository.create_draft(
-        context_id=2,
+        account.id,
+        context_id=context.id,
         schedule_id=None,
         text="A market observation.",
         topic="market",
@@ -154,7 +171,7 @@ def test_slack_review_message_points_to_human_dashboard(repository):
         similarity_score=0.1,
         attempt=1,
         parent_draft_id=None,
-        config_version=repository.current_config_version(),
+        config_version=repository.current_config_version(account.id),
         expires_at=None,
         generator_provider="demo",
         prompt_snapshot="",
@@ -163,21 +180,25 @@ def test_slack_review_message_points_to_human_dashboard(repository):
 
     result = notifier.notify_for_review(
         draft,
-        repository.get_profile(),
-        repository.get_context(2),
+        account,
+        repository.get_profile(account.id),
+        context,
     )
 
     assert result.success is True
     payload = json.loads(requests[0].content)
     assert payload["blocks"][-1]["elements"][0]["url"] == (
-        f"https://review.example/#draft-{draft.id}"
+        f"https://review.example/accounts/{account.id}#draft-{draft.id}"
     )
 
 
 def test_dry_run_publisher_never_calls_external_provider(repository):
     """Renamed from test_dry_run_publisher_never_calls_x to be provider-neutral."""
+    account = repository.list_accounts()[0]
+    context = repository.list_contexts(account.id)[2]
     draft = repository.create_draft(
-        context_id=3,
+        account.id,
+        context_id=context.id,
         schedule_id=None,
         text="A safe prototype post.",
         topic="prototype",
@@ -187,7 +208,7 @@ def test_dry_run_publisher_never_calls_external_provider(repository):
         similarity_score=0.1,
         attempt=1,
         parent_draft_id=None,
-        config_version=repository.current_config_version(),
+        config_version=repository.current_config_version(account.id),
         expires_at=None,
         generator_provider="demo",
         prompt_snapshot="",
@@ -217,7 +238,7 @@ def test_buffer_publisher_sends_post_to_configured_api_url(repository):
         return httpx.Response(200, json=_buffer_success_response(), request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    result = BufferPublisher(settings, client=client).publish(draft)
+    result = BufferPublisher(settings, _buffer_target(), client=client).publish(draft)
 
     assert len(requests) == 1
     assert "api.buffer.com" in str(requests[0].url)
@@ -236,9 +257,11 @@ def test_buffer_publisher_sends_authorization_bearer_header(repository):
         return httpx.Response(200, json=_buffer_success_response(), request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    BufferPublisher(settings, client=client).publish(draft)
+    BufferPublisher(
+        settings, _buffer_target(api_key="account-specific-key"), client=client
+    ).publish(draft)
 
-    assert requests[0].headers["authorization"] == "Bearer test-buffer-api-key"
+    assert requests[0].headers["authorization"] == "Bearer account-specific-key"
 
 
 def test_buffer_publisher_sends_graphql_create_post_mutation(repository):
@@ -254,7 +277,7 @@ def test_buffer_publisher_sends_graphql_create_post_mutation(repository):
         return httpx.Response(200, json=_buffer_success_response(), request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    BufferPublisher(settings, client=client).publish(draft)
+    BufferPublisher(settings, _buffer_target(), client=client).publish(draft)
 
     body = json.loads(requests[0].content)
     assert "createPost" in body["query"]
@@ -274,12 +297,14 @@ def test_buffer_publisher_sends_correct_variables(repository):
         return httpx.Response(200, json=_buffer_success_response(), request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    BufferPublisher(settings, client=client).publish(draft)
+    BufferPublisher(
+        settings, _buffer_target(channel_id="account-channel"), client=client
+    ).publish(draft)
 
     body = json.loads(requests[0].content)
     inp = body["variables"]["input"]
     assert inp["text"] == draft.text
-    assert inp["channelId"] == "chan-abc"
+    assert inp["channelId"] == "account-channel"
     assert inp["schedulingType"] == "automatic"
     assert inp["mode"] == "shareNow"
     assert inp["aiAssisted"] is True
@@ -299,7 +324,7 @@ def test_buffer_publisher_parses_post_action_success(repository):
         return httpx.Response(200, json=response_body, request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    result = BufferPublisher(settings, client=client).publish(draft)
+    result = BufferPublisher(settings, _buffer_target(), client=client).publish(draft)
 
     assert result.success is True
     assert result.provider == "buffer"
@@ -319,7 +344,7 @@ def test_buffer_publisher_null_external_link_does_not_create_fake_url(repository
         return httpx.Response(200, json=response_body, request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    result = BufferPublisher(settings, client=client).publish(draft)
+    result = BufferPublisher(settings, _buffer_target(), client=client).publish(draft)
 
     assert result.success is True
     assert result.post_url == ""
@@ -347,7 +372,7 @@ def test_buffer_publisher_typed_mutation_error_returns_failure(repository):
         return httpx.Response(200, json=error_body, request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    result = BufferPublisher(settings, client=client).publish(draft)
+    result = BufferPublisher(settings, _buffer_target(), client=client).publish(draft)
 
     assert result.success is False
     assert result.provider == "buffer"
@@ -366,7 +391,7 @@ def test_buffer_publisher_top_level_graphql_errors_return_failure(repository):
         return httpx.Response(200, json=error_body, request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    result = BufferPublisher(settings, client=client).publish(draft)
+    result = BufferPublisher(settings, _buffer_target(), client=client).publish(draft)
 
     assert result.success is False
     assert result.provider == "buffer"
@@ -383,55 +408,61 @@ def test_buffer_publisher_http_failure_returns_failure(repository):
         return httpx.Response(503, text="Service Unavailable", request=request)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    result = BufferPublisher(settings, client=client).publish(draft)
+    result = BufferPublisher(settings, _buffer_target(), client=client).publish(draft)
 
     assert result.success is False
     assert result.provider == "buffer"
 
 
 def test_publisher_manager_selects_dry_run_when_live_posting_disabled(settings, repository):
-    """PublisherManager must use DryRunPublisher when buffer_live_posting=False."""
-    from app.services.publishers import DryRunPublisher, PublisherManager
+    """The global switch keeps every account in dry-run mode."""
+    from app.services.publishers import PublisherManager
 
+    account = repository.list_accounts()[0]
+    account = repository.update_account(account.id, {"live_posting_enabled": True})
     mgr = PublisherManager(settings)
-    assert isinstance(mgr.publisher, DryRunPublisher)
+    result = mgr.publish(_make_draft(repository), account, _buffer_target())
+
+    assert result.success is True
+    assert result.provider == "dry_run"
 
 
-def test_publisher_manager_selects_dry_run_when_api_key_missing(repository):
-    """PublisherManager must use DryRunPublisher when buffer_api_key is missing."""
-    from app.config import Settings
-    from app.services.publishers import DryRunPublisher, PublisherManager
+def test_publisher_manager_fails_when_live_account_has_no_target(repository):
+    """Missing live credentials are visible failures, never silent dry runs."""
+    from app.services.publishers import PublisherManager
 
-    s = Settings(
-        app_mode="demo",
-        database_path=":memory:",
-        scheduler_enabled=False,
-        buffer_live_posting=True,
-        buffer_api_key="",
-        buffer_channel_id="chan-abc",
+    account = repository.list_accounts()[0]
+    account = repository.update_account(account.id, {"live_posting_enabled": True})
+    result = PublisherManager(_buffer_settings()).publish(
+        _make_draft(repository), account, None
     )
-    assert isinstance(PublisherManager(s).publisher, DryRunPublisher)
+
+    assert result.success is False
+    assert result.provider == "buffer"
+    assert "missing" in result.error.lower()
 
 
-def test_publisher_manager_selects_dry_run_when_channel_id_missing(repository):
-    """PublisherManager must use DryRunPublisher when buffer_channel_id is missing."""
-    from app.config import Settings
-    from app.services.publishers import DryRunPublisher, PublisherManager
+def test_publisher_manager_uses_per_call_buffer_target(repository):
+    """Live publication uses the account target supplied for this call."""
+    from app.services.publishers import PublisherManager
 
-    s = Settings(
-        app_mode="demo",
-        database_path=":memory:",
-        scheduler_enabled=False,
-        buffer_live_posting=True,
-        buffer_api_key="test-buffer-api-key",
-        buffer_channel_id="",
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_buffer_success_response(), request=request)
+
+    account = repository.list_accounts()[0]
+    account = repository.update_account(account.id, {"live_posting_enabled": True})
+    manager = PublisherManager(
+        _buffer_settings(), client=httpx.Client(transport=httpx.MockTransport(handler))
     )
-    assert isinstance(PublisherManager(s).publisher, DryRunPublisher)
+    result = manager.publish(
+        _make_draft(repository),
+        account,
+        _buffer_target(api_key="dynamic-key", channel_id="dynamic-channel"),
+    )
 
-
-def test_publisher_manager_selects_buffer_publisher_with_full_credentials(repository):
-    """PublisherManager must select BufferPublisher when live posting and both credentials are set."""
-    from app.services.publishers import BufferPublisher, PublisherManager
-
-    s = _buffer_settings()
-    assert isinstance(PublisherManager(s).publisher, BufferPublisher)
+    assert result.success is True
+    assert requests[0].headers["authorization"] == "Bearer dynamic-key"
+    assert json.loads(requests[0].content)["variables"]["input"]["channelId"] == "dynamic-channel"

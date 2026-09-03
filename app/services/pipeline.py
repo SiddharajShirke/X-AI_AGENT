@@ -3,11 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from app.config import Settings
-from app.db import utc_now_iso
-from app.models import Draft
+from app.models import Draft, PublishResult
 from app.repository import Repository
 from app.services.feedback import FeedbackEngine
 from app.services.generation import ContentGenerator, GenerationInput
+from app.services.integrations import IntegrationError, IntegrationService
 from app.services.notifiers import NotifierManager
 from app.services.publishers import PublisherManager
 from app.services.safety import SafetyGuard
@@ -29,6 +29,7 @@ class Pipeline:
         safety_guard: SafetyGuard,
         similarity_guard: SimilarityGuard,
         feedback_engine: FeedbackEngine,
+        integrations: IntegrationService,
         notifiers: NotifierManager,
         publishers: PublisherManager,
     ):
@@ -39,6 +40,7 @@ class Pipeline:
         self.safety_guard = safety_guard
         self.similarity_guard = similarity_guard
         self.feedback_engine = feedback_engine
+        self.integrations = integrations
         self.notifiers = notifiers
         self.publishers = publishers
 
@@ -169,6 +171,8 @@ class Pipeline:
         if not account.enabled:
             raise PipelineError(f"X account @{account.handle} is paused")
         draft = self.repository.get_draft(x_account_id, draft_id)
+        if draft.status in {"publishing", "published", "failed", "blocked"}:
+            return draft
         if draft.status != "pending":
             raise PipelineError(f"Only pending drafts can be approved; status is {draft.status}")
         profile = self.repository.get_profile(x_account_id)
@@ -190,30 +194,47 @@ class Pipeline:
             )
             return blocked
 
-        approved_at = utc_now_iso()
-        draft = self.repository.update_draft(
+        claimed = self.repository.claim_publish(
             x_account_id,
             draft.id,
-            status="approved",
-            approved_at=approved_at,
             reviewer=reviewer,
-            expires_at=None,
+            origin=origin,
         )
-        result = self.publishers.publish(draft)
+        if claimed is None:
+            return self.repository.get_draft(x_account_id, draft.id)
+        draft, attempt = claimed
+        return self._publish_claimed(account, draft, attempt.id, reviewer, origin)
+
+    def _publish_claimed(
+        self,
+        account,
+        draft: Draft,
+        attempt_id: int,
+        reviewer: str,
+        origin: str,
+    ) -> Draft:
+        target = None
+        if self.settings.buffer_live_posting and account.live_posting_enabled:
+            try:
+                target = self.integrations.resolve_buffer(account.id)
+            except IntegrationError as exc:
+                result = PublishResult(
+                    success=False,
+                    provider="buffer",
+                    error=str(exc),
+                )
+            else:
+                result = self.publishers.publish(draft, account, target)
+        else:
+            result = self.publishers.publish(draft, account, target)
+
+        draft = self.repository.complete_publish(
+            account.id, draft.id, attempt_id, result
+        )
         if result.success:
-            draft = self.repository.update_draft(
-                x_account_id,
-                draft.id,
-                status="published",
-                published_at=utc_now_iso(),
-                publisher_provider=result.provider,
-                external_post_id=result.external_post_id,
-                post_url=result.post_url,
-                error="",
-            )
             self.feedback_engine.record_approval(draft, reviewer)
             self.repository.log_event(
-                x_account_id,
+                account.id,
                 "draft_published",
                 draft.id,
                 {
@@ -225,15 +246,8 @@ class Pipeline:
             )
             self.notifiers.notify_status(draft, account, "Approved and published")
         else:
-            draft = self.repository.update_draft(
-                x_account_id,
-                draft.id,
-                status="failed",
-                publisher_provider=result.provider,
-                error=result.error,
-            )
             self.repository.log_event(
-                x_account_id,
+                account.id,
                 "publish_failed",
                 draft.id,
                 {
@@ -264,9 +278,29 @@ class Pipeline:
             raise PipelineError(
                 f"Only failed drafts can retry publishing; status is {draft.status}"
             )
-        self.repository.update_draft(x_account_id, draft.id, status="pending")
-        return self.approve(
-            x_account_id, draft.id, reviewer=reviewer, origin=origin
+        profile = self.repository.get_profile(x_account_id)
+        safety = self.safety_guard.check(draft.text, profile)
+        if not safety.safe:
+            return self.repository.update_draft(
+                x_account_id,
+                draft.id,
+                status="blocked",
+                safety_status="blocked",
+                error="; ".join(safety.reasons),
+                reviewer=reviewer,
+            )
+        claimed = self.repository.claim_publish(
+            x_account_id,
+            draft.id,
+            reviewer=reviewer,
+            origin=origin,
+            allow_retry=True,
+        )
+        if claimed is None:
+            return self.repository.get_draft(x_account_id, draft.id)
+        claimed_draft, attempt = claimed
+        return self._publish_claimed(
+            account, claimed_draft, attempt.id, reviewer, origin
         )
 
     def reject_and_regenerate(
