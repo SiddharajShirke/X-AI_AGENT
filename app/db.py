@@ -103,18 +103,22 @@ class Database:
                     tone TEXT NOT NULL,
                     live_trends_required INTEGER NOT NULL DEFAULT 0,
                     instructions TEXT NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 1
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(x_account_id, id)
                 );
 
                 CREATE TABLE IF NOT EXISTS schedule_slots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     x_account_id INTEGER NOT NULL DEFAULT 1 REFERENCES x_accounts(id),
-                    context_id INTEGER NOT NULL REFERENCES content_contexts(id),
+                    context_id INTEGER NOT NULL,
                     slot_number INTEGER NOT NULL,
                     time_local TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     last_run_date TEXT NOT NULL DEFAULT '',
-                    UNIQUE(x_account_id, slot_number)
+                    UNIQUE(x_account_id, slot_number),
+                    UNIQUE(x_account_id, id),
+                    FOREIGN KEY (x_account_id, context_id)
+                        REFERENCES content_contexts(x_account_id, id)
                 );
 
                 CREATE TABLE IF NOT EXISTS config_versions (
@@ -141,8 +145,8 @@ class Database:
                 CREATE TABLE IF NOT EXISTS drafts (
                     id TEXT PRIMARY KEY,
                     x_account_id INTEGER NOT NULL DEFAULT 1 REFERENCES x_accounts(id),
-                    context_id INTEGER NOT NULL REFERENCES content_contexts(id),
-                    schedule_id INTEGER REFERENCES schedule_slots(id),
+                    context_id INTEGER NOT NULL,
+                    schedule_id INTEGER,
                     text TEXT NOT NULL,
                     topic TEXT NOT NULL,
                     source_summary TEXT NOT NULL,
@@ -150,7 +154,7 @@ class Database:
                     safety_status TEXT NOT NULL,
                     similarity_score REAL NOT NULL,
                     attempt INTEGER NOT NULL,
-                    parent_draft_id TEXT REFERENCES drafts(id),
+                    parent_draft_id TEXT,
                     config_version INTEGER NOT NULL,
                     expires_at TEXT,
                     generator_provider TEXT NOT NULL,
@@ -164,18 +168,31 @@ class Database:
                     publisher_provider TEXT NOT NULL DEFAULT '',
                     external_post_id TEXT NOT NULL DEFAULT '',
                     post_url TEXT NOT NULL DEFAULT '',
-                    error TEXT NOT NULL DEFAULT ''
+                    error TEXT NOT NULL DEFAULT '',
+                    UNIQUE(x_account_id, id),
+                    FOREIGN KEY (x_account_id, context_id)
+                        REFERENCES content_contexts(x_account_id, id),
+                    FOREIGN KEY (x_account_id, schedule_id)
+                        REFERENCES schedule_slots(x_account_id, id),
+                    FOREIGN KEY (x_account_id, parent_draft_id)
+                        REFERENCES drafts(x_account_id, id),
+                    FOREIGN KEY (x_account_id, config_version)
+                        REFERENCES config_versions(x_account_id, version)
                 );
 
                 CREATE TABLE IF NOT EXISTS feedback (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    draft_id TEXT NOT NULL REFERENCES drafts(id),
+                    x_account_id INTEGER NOT NULL DEFAULT 1 REFERENCES x_accounts(id),
+                    draft_id TEXT NOT NULL,
                     decision TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     notes TEXT NOT NULL,
                     learned_rule TEXT NOT NULL,
                     reviewer TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    UNIQUE(x_account_id, id),
+                    FOREIGN KEY (x_account_id, draft_id)
+                        REFERENCES drafts(x_account_id, id)
                 );
 
                 CREATE TABLE IF NOT EXISTS preferences (
@@ -183,11 +200,13 @@ class Database:
                     x_account_id INTEGER NOT NULL DEFAULT 1 REFERENCES x_accounts(id),
                     rule TEXT NOT NULL,
                     weight REAL NOT NULL DEFAULT 1.0,
-                    source_feedback_id INTEGER REFERENCES feedback(id),
+                    source_feedback_id INTEGER,
                     active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE(x_account_id, rule)
+                    UNIQUE(x_account_id, rule),
+                    FOREIGN KEY (x_account_id, source_feedback_id)
+                        REFERENCES feedback(x_account_id, id)
                 );
 
                 CREATE TABLE IF NOT EXISTS event_log (
@@ -196,7 +215,9 @@ class Database:
                     event_type TEXT NOT NULL,
                     draft_id TEXT,
                     details_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (x_account_id, draft_id)
+                        REFERENCES drafts(x_account_id, id)
                 );
 
                 CREATE TABLE IF NOT EXISTS integration_connections (
@@ -223,7 +244,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS publish_attempts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     x_account_id INTEGER NOT NULL REFERENCES x_accounts(id),
-                    draft_id TEXT NOT NULL REFERENCES drafts(id),
+                    draft_id TEXT NOT NULL,
                     attempt_number INTEGER NOT NULL,
                     status TEXT NOT NULL,
                     origin TEXT NOT NULL,
@@ -231,7 +252,9 @@ class Database:
                     error TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     completed_at TEXT,
-                    UNIQUE(draft_id, attempt_number)
+                    UNIQUE(draft_id, attempt_number),
+                    FOREIGN KEY (x_account_id, draft_id)
+                        REFERENCES drafts(x_account_id, id)
                 );
                 """
         )
@@ -268,6 +291,15 @@ class Database:
             else "Asia/Kolkata"
         )
         now = utc_now_iso()
+        schema_version = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_metadata"
+        ).fetchone()[0]
+        upgrade_relationships = schema_version < 2
+
+        def account_source(table: str) -> str:
+            if "x_account_id" in self._columns(conn, table):
+                return "x_account_id"
+            return "1"
 
         conn.commit()
         conn.execute("PRAGMA foreign_keys = OFF")
@@ -319,7 +351,10 @@ class Database:
                     "max_attempts, approval_timeout_minutes, updated_at",
                 )
 
-            if "x_account_id" not in self._columns(conn, "content_contexts"):
+            if upgrade_relationships or "x_account_id" not in self._columns(
+                conn, "content_contexts"
+            ):
+                context_account = account_source("content_contexts")
                 self._replace_table(
                     conn,
                     "content_contexts",
@@ -332,14 +367,18 @@ class Database:
                         tone TEXT NOT NULL,
                         live_trends_required INTEGER NOT NULL DEFAULT 0,
                         instructions TEXT NOT NULL,
-                        enabled INTEGER NOT NULL DEFAULT 1
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        UNIQUE(x_account_id, id)
                     )
                     """,
                     "id, x_account_id, name, purpose, tone, live_trends_required, instructions, enabled",
-                    "id, 1, name, purpose, tone, live_trends_required, instructions, enabled",
+                    f"id, {context_account}, name, purpose, tone, live_trends_required, instructions, enabled",
                 )
 
-            if "x_account_id" not in self._columns(conn, "schedule_slots"):
+            if upgrade_relationships or "x_account_id" not in self._columns(
+                conn, "schedule_slots"
+            ):
+                schedule_account = account_source("schedule_slots")
                 self._replace_table(
                     conn,
                     "schedule_slots",
@@ -347,16 +386,19 @@ class Database:
                     CREATE TABLE {table} (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         x_account_id INTEGER NOT NULL DEFAULT 1 REFERENCES x_accounts(id),
-                        context_id INTEGER NOT NULL REFERENCES content_contexts(id),
+                        context_id INTEGER NOT NULL,
                         slot_number INTEGER NOT NULL,
                         time_local TEXT NOT NULL,
                         enabled INTEGER NOT NULL DEFAULT 1,
                         last_run_date TEXT NOT NULL DEFAULT '',
-                        UNIQUE(x_account_id, slot_number)
+                        UNIQUE(x_account_id, slot_number),
+                        UNIQUE(x_account_id, id),
+                        FOREIGN KEY (x_account_id, context_id)
+                            REFERENCES content_contexts(x_account_id, id)
                     )
                     """,
                     "id, x_account_id, context_id, slot_number, time_local, enabled, last_run_date",
-                    "id, 1, context_id, slot_number, time_local, enabled, last_run_date",
+                    f"id, {schedule_account}, context_id, slot_number, time_local, enabled, last_run_date",
                 )
 
             if "x_account_id" not in self._columns(conn, "config_versions"):
@@ -398,7 +440,8 @@ class Database:
                     "id, 1, title, summary, source, url, score, active, collected_at",
                 )
 
-            if "x_account_id" not in self._columns(conn, "drafts"):
+            if upgrade_relationships or "x_account_id" not in self._columns(conn, "drafts"):
+                draft_account = account_source("drafts")
                 self._replace_table(
                     conn,
                     "drafts",
@@ -406,8 +449,8 @@ class Database:
                     CREATE TABLE {table} (
                         id TEXT PRIMARY KEY,
                         x_account_id INTEGER NOT NULL DEFAULT 1 REFERENCES x_accounts(id),
-                        context_id INTEGER NOT NULL REFERENCES content_contexts(id),
-                        schedule_id INTEGER REFERENCES schedule_slots(id),
+                        context_id INTEGER NOT NULL,
+                        schedule_id INTEGER,
                         text TEXT NOT NULL,
                         topic TEXT NOT NULL,
                         source_summary TEXT NOT NULL,
@@ -415,7 +458,7 @@ class Database:
                         safety_status TEXT NOT NULL,
                         similarity_score REAL NOT NULL,
                         attempt INTEGER NOT NULL,
-                        parent_draft_id TEXT REFERENCES drafts(id),
+                        parent_draft_id TEXT,
                         config_version INTEGER NOT NULL,
                         expires_at TEXT,
                         generator_provider TEXT NOT NULL,
@@ -429,7 +472,16 @@ class Database:
                         publisher_provider TEXT NOT NULL DEFAULT '',
                         external_post_id TEXT NOT NULL DEFAULT '',
                         post_url TEXT NOT NULL DEFAULT '',
-                        error TEXT NOT NULL DEFAULT ''
+                        error TEXT NOT NULL DEFAULT '',
+                        UNIQUE(x_account_id, id),
+                        FOREIGN KEY (x_account_id, context_id)
+                            REFERENCES content_contexts(x_account_id, id),
+                        FOREIGN KEY (x_account_id, schedule_id)
+                            REFERENCES schedule_slots(x_account_id, id),
+                        FOREIGN KEY (x_account_id, parent_draft_id)
+                            REFERENCES drafts(x_account_id, id),
+                        FOREIGN KEY (x_account_id, config_version)
+                            REFERENCES config_versions(x_account_id, version)
                     )
                     """,
                     "id, x_account_id, context_id, schedule_id, text, topic, source_summary, status, "
@@ -437,13 +489,45 @@ class Database:
                     "expires_at, generator_provider, prompt_snapshot, rejection_reason, reviewer_notes, "
                     "reviewer, created_at, approved_at, published_at, publisher_provider, external_post_id, "
                     "post_url, error",
-                    "id, 1, context_id, schedule_id, text, topic, source_summary, status, safety_status, "
+                    f"id, {draft_account}, context_id, schedule_id, text, topic, source_summary, status, safety_status, "
                     "similarity_score, attempt, parent_draft_id, config_version, expires_at, "
                     "generator_provider, prompt_snapshot, rejection_reason, reviewer_notes, reviewer, "
                     "created_at, approved_at, published_at, publisher_provider, external_post_id, post_url, error",
                 )
 
-            if "x_account_id" not in self._columns(conn, "preferences"):
+            if upgrade_relationships or "x_account_id" not in self._columns(conn, "feedback"):
+                feedback_account = (
+                    account_source("feedback")
+                    if "x_account_id" in self._columns(conn, "feedback")
+                    else "(SELECT drafts.x_account_id FROM drafts WHERE drafts.id = feedback.draft_id)"
+                )
+                self._replace_table(
+                    conn,
+                    "feedback",
+                    """
+                    CREATE TABLE {table} (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        x_account_id INTEGER NOT NULL DEFAULT 1 REFERENCES x_accounts(id),
+                        draft_id TEXT NOT NULL,
+                        decision TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        notes TEXT NOT NULL,
+                        learned_rule TEXT NOT NULL,
+                        reviewer TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(x_account_id, id),
+                        FOREIGN KEY (x_account_id, draft_id)
+                            REFERENCES drafts(x_account_id, id)
+                    )
+                    """,
+                    "id, x_account_id, draft_id, decision, reason, notes, learned_rule, reviewer, created_at",
+                    f"id, {feedback_account}, draft_id, decision, reason, notes, learned_rule, reviewer, created_at",
+                )
+
+            if upgrade_relationships or "x_account_id" not in self._columns(
+                conn, "preferences"
+            ):
+                preference_account = account_source("preferences")
                 self._replace_table(
                     conn,
                     "preferences",
@@ -453,18 +537,21 @@ class Database:
                         x_account_id INTEGER NOT NULL DEFAULT 1 REFERENCES x_accounts(id),
                         rule TEXT NOT NULL,
                         weight REAL NOT NULL DEFAULT 1.0,
-                        source_feedback_id INTEGER REFERENCES feedback(id),
+                        source_feedback_id INTEGER,
                         active INTEGER NOT NULL DEFAULT 1,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
-                        UNIQUE(x_account_id, rule)
+                        UNIQUE(x_account_id, rule),
+                        FOREIGN KEY (x_account_id, source_feedback_id)
+                            REFERENCES feedback(x_account_id, id)
                     )
                     """,
                     "id, x_account_id, rule, weight, source_feedback_id, active, created_at, updated_at",
-                    "id, 1, rule, weight, source_feedback_id, active, created_at, updated_at",
+                    f"id, {preference_account}, rule, weight, source_feedback_id, active, created_at, updated_at",
                 )
 
-            if "x_account_id" not in self._columns(conn, "event_log"):
+            if upgrade_relationships or "x_account_id" not in self._columns(conn, "event_log"):
+                event_account = account_source("event_log")
                 self._replace_table(
                     conn,
                     "event_log",
@@ -475,25 +562,54 @@ class Database:
                         event_type TEXT NOT NULL,
                         draft_id TEXT,
                         details_json TEXT NOT NULL,
-                        created_at TEXT NOT NULL
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY (x_account_id, draft_id)
+                            REFERENCES drafts(x_account_id, id)
                     )
                     """,
                     "id, x_account_id, event_type, draft_id, details_json, created_at",
-                    "id, 1, event_type, draft_id, details_json, created_at",
+                    f"id, {event_account}, event_type, draft_id, details_json, created_at",
+                )
+
+            if upgrade_relationships:
+                publish_account = account_source("publish_attempts")
+                self._replace_table(
+                    conn,
+                    "publish_attempts",
+                    """
+                    CREATE TABLE {table} (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        x_account_id INTEGER NOT NULL REFERENCES x_accounts(id),
+                        draft_id TEXT NOT NULL,
+                        attempt_number INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        origin TEXT NOT NULL,
+                        reviewer TEXT NOT NULL,
+                        error TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        UNIQUE(draft_id, attempt_number),
+                        FOREIGN KEY (x_account_id, draft_id)
+                            REFERENCES drafts(x_account_id, id)
+                    )
+                    """,
+                    "id, x_account_id, draft_id, attempt_number, status, origin, reviewer, error, created_at, completed_at",
+                    f"id, {publish_account}, draft_id, attempt_number, status, origin, reviewer, error, created_at, completed_at",
                 )
 
             conn.execute("DELETE FROM schema_metadata")
-            conn.execute("INSERT INTO schema_metadata (version) VALUES (1)")
+            conn.execute("INSERT INTO schema_metadata (version) VALUES (2)")
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError(
+                    f"Account migration broke foreign keys: {violations!r}"
+                )
             conn.commit()
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.execute("PRAGMA foreign_keys = ON")
-
-        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if violations:
-            raise sqlite3.IntegrityError(f"Account migration broke foreign keys: {violations!r}")
 
     @staticmethod
     def _create_indexes(conn: sqlite3.Connection) -> None:

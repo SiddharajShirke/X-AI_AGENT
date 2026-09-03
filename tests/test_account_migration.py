@@ -304,3 +304,208 @@ def test_account_local_uniqueness_and_single_publishing_claim(database):
                 """,
                 (draft_id, now),
             )
+
+
+def _insert_account(conn, account_id: int) -> None:
+    now = "2026-01-01T00:00:00+00:00"
+    conn.execute(
+        """
+        INSERT INTO x_accounts
+            (id, name, handle, enabled, live_posting_enabled, timezone, created_at, updated_at)
+        VALUES (?, ?, ?, 1, 0, 'UTC', ?, ?)
+        """,
+        (account_id, f"Account {account_id}", f"account_{account_id}", now, now),
+    )
+
+
+def _insert_context(conn, x_account_id: int, name: str) -> int:
+    return conn.execute(
+        """
+        INSERT INTO content_contexts
+            (x_account_id, name, purpose, tone, live_trends_required, instructions, enabled)
+        VALUES (?, ?, 'Test', 'plain', 0, '', 1)
+        """,
+        (x_account_id, name),
+    ).lastrowid
+
+
+def _insert_config_version(conn, x_account_id: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO config_versions (x_account_id, version, snapshot_json, created_at)
+        VALUES (?, 1, '{}', '2026-01-01T00:00:00+00:00')
+        """,
+        (x_account_id,),
+    )
+
+
+def _insert_draft(
+    conn,
+    draft_id: str,
+    x_account_id: int,
+    context_id: int,
+    *,
+    schedule_id: int | None = None,
+    parent_draft_id: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO drafts (
+            id, x_account_id, context_id, schedule_id, text, topic, source_summary,
+            status, safety_status, similarity_score, attempt, parent_draft_id,
+            config_version, generator_provider, created_at
+        ) VALUES (?, ?, ?, ?, 'Safe draft', 'Test', 'manual', 'pending', 'safe',
+                  0.0, 1, ?, 1, 'demo', '2026-01-01T00:00:00+00:00')
+        """,
+        (draft_id, x_account_id, context_id, schedule_id, parent_draft_id),
+    )
+
+
+def test_schedule_rejects_context_owned_by_another_account(database):
+    database.initialize()
+
+    with database.connection() as conn:
+        _insert_account(conn, 2)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO schedule_slots
+                    (x_account_id, context_id, slot_number, time_local, enabled, last_run_date)
+                VALUES (2, 1, 1, '09:00', 1, '')
+                """
+            )
+
+
+def test_draft_rejects_configuration_and_lineage_from_another_account(database):
+    database.initialize()
+
+    with database.connection() as conn:
+        _insert_account(conn, 2)
+        context_id = _insert_context(conn, 2, "Second context")
+        _insert_config_version(conn, 2)
+        schedule_id = conn.execute(
+            """
+            INSERT INTO schedule_slots
+                (x_account_id, context_id, slot_number, time_local, enabled, last_run_date)
+            VALUES (2, ?, 1, '09:00', 1, '')
+            """,
+            (context_id,),
+        ).lastrowid
+        _insert_draft(conn, "account-one-parent", 1, 1)
+
+        invalid_relationships = [
+            ("foreign-context", 1, None, None),
+            ("foreign-schedule", context_id, 1, None),
+            ("foreign-parent", context_id, schedule_id, "account-one-parent"),
+        ]
+        for draft_id, draft_context_id, draft_schedule_id, parent_id in invalid_relationships:
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_draft(
+                    conn,
+                    draft_id,
+                    2,
+                    draft_context_id,
+                    schedule_id=draft_schedule_id,
+                    parent_draft_id=parent_id,
+                )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO drafts (
+                    id, x_account_id, context_id, text, topic, source_summary, status,
+                    safety_status, similarity_score, attempt, config_version,
+                    generator_provider, created_at
+                ) VALUES ('foreign-config', 2, ?, 'Safe draft', 'Test', 'manual',
+                          'pending', 'safe', 0.0, 1, 99, 'demo',
+                          '2026-01-01T00:00:00+00:00')
+                """,
+                (context_id,),
+            )
+
+
+def test_history_and_publication_reject_cross_account_links(database):
+    database.initialize()
+
+    with database.connection() as conn:
+        _insert_account(conn, 2)
+        context_id = _insert_context(conn, 2, "Second context")
+        _insert_config_version(conn, 2)
+        _insert_draft(conn, "account-one-draft", 1, 1)
+
+        feedback_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(feedback)")
+        }
+        assert "x_account_id" in feedback_columns
+
+        feedback_id = conn.execute(
+            """
+            INSERT INTO feedback (
+                x_account_id, draft_id, decision, reason, notes, learned_rule,
+                reviewer, created_at
+            ) VALUES (1, 'account-one-draft', 'rejected', 'other', '', 'Keep detail',
+                      'admin', '2026-01-01T00:00:00+00:00')
+            """
+        ).lastrowid
+
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO feedback (
+                    x_account_id, draft_id, decision, reason, notes, learned_rule,
+                    reviewer, created_at
+                ) VALUES (2, 'account-one-draft', 'rejected', 'other', '', 'Bad link',
+                          'admin', '2026-01-01T00:00:00+00:00')
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO preferences (
+                    x_account_id, rule, source_feedback_id, created_at, updated_at
+                ) VALUES (2, 'Cross-account preference', ?,
+                          '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+                """,
+                (feedback_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO event_log
+                    (x_account_id, event_type, draft_id, details_json, created_at)
+                VALUES (2, 'draft_generated', 'account-one-draft', '{}',
+                        '2026-01-01T00:00:00+00:00')
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO publish_attempts (
+                    x_account_id, draft_id, attempt_number, status, origin,
+                    reviewer, created_at
+                ) VALUES (2, 'account-one-draft', 1, 'publishing', 'dashboard',
+                          'admin', '2026-01-01T00:00:00+00:00')
+                """
+            )
+
+
+def test_failed_foreign_key_validation_rolls_back_legacy_rebuild(legacy_database):
+    with legacy_database.connection() as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute(
+            """
+            INSERT INTO schedule_slots
+                (id, context_id, slot_number, time_local, enabled, last_run_date)
+            VALUES (22, 999, 8, '14:45', 1, '')
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="broke foreign keys"):
+        legacy_database.initialize()
+
+    with legacy_database.connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM schema_metadata").fetchone()[0] == 0
+        schedule_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(schedule_slots)")
+        }
+        assert "x_account_id" not in schedule_columns
