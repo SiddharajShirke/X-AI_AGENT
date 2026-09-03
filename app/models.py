@@ -12,6 +12,7 @@ class Model(BaseModel):
 
 class StartupProfile(Model):
     id: int = 1
+    x_account_id: int = 1
     name: str
     domain: str
     target_audience: list[str] = Field(default_factory=list)
@@ -32,6 +33,7 @@ class StartupProfile(Model):
 
 class ContentContext(Model):
     id: int
+    x_account_id: int = 1
     name: str
     purpose: str
     tone: str
@@ -42,6 +44,7 @@ class ContentContext(Model):
 
 class ScheduleSlot(Model):
     id: int
+    x_account_id: int = 1
     context_id: int
     slot_number: int
     time_local: str
@@ -51,6 +54,7 @@ class ScheduleSlot(Model):
 
 class TrendItem(Model):
     id: int | None = None
+    x_account_id: int = 1
     title: str
     summary: str
     source: str
@@ -62,6 +66,7 @@ class TrendItem(Model):
 
 class Draft(Model):
     id: str
+    x_account_id: int = 1
     context_id: int
     schedule_id: int | None = None
     text: str
@@ -101,6 +106,7 @@ class FeedbackRecord(Model):
 
 class LearnedPreference(Model):
     id: int
+    x_account_id: int = 1
     rule: str
     weight: float
     source_feedback_id: int | None = None
@@ -141,6 +147,56 @@ class PublishResult(Model):
 
 
 class NotificationResult(Model):
+    success: bool
+    provider: str
+    error: str = ""
+
+
+class XAccount(Model):
+    id: int
+    name: str
+    handle: str
+    enabled: bool
+    live_posting_enabled: bool
+    timezone: str
+    created_at: str
+    updated_at: str
+
+
+class IntegrationConnection(Model):
+    id: int
+    provider: str
+    label: str
+    credentials_configured: bool
+    created_at: str
+    updated_at: str
+
+
+class AccountIntegration(Model):
+    x_account_id: int
+    provider: str
+    connection_id: int
+    target_id: str
+    enabled: bool
+    last_test_success: bool | None
+    last_test_error: str
+    last_tested_at: str | None
+
+
+class PublishAttempt(Model):
+    id: int
+    x_account_id: int
+    draft_id: str
+    attempt_number: int
+    status: str
+    origin: str
+    reviewer: str
+    error: str
+    created_at: str
+    completed_at: str | None
+
+
+class ConnectionTestResult(Model):
     success: bool
     provider: str
     error: str = ""

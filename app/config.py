@@ -28,6 +28,8 @@ class Settings(BaseSettings):
 
     admin_username: str = "admin"
     admin_password: str = "change-me"
+    app_encryption_key: str = ""
+    app_csrf_secret: str = ""
 
     scheduler_enabled: bool = True
     scheduler_poll_seconds: int = Field(default=20, ge=5, le=300)
