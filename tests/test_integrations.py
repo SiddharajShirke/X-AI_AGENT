@@ -187,7 +187,10 @@ def test_slack_review_message_points_to_human_dashboard(repository):
 
     assert result.success is True
     payload = json.loads(requests[0].content)
-    assert payload["blocks"][-1]["elements"][0]["url"] == (
+    dashboard_button = next(
+        item for item in payload["blocks"][-1]["elements"] if item.get("url")
+    )
+    assert dashboard_button["url"] == (
         f"https://review.example/accounts/{account.id}#draft-{draft.id}"
     )
 

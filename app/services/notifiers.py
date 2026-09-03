@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import Protocol
 
@@ -7,6 +8,7 @@ import httpx
 
 from app.config import Settings
 from app.models import ContentContext, Draft, NotificationResult, StartupProfile, XAccount
+from app.services.integrations import IntegrationError, IntegrationService
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +134,10 @@ class SlackNotifier:
         self, draft: Draft, account: XAccount, profile: StartupProfile, context: ContentContext
     ) -> NotificationResult:
         review_url = f"{self.base_url}/accounts/{account.id}#draft-{draft.id}"
+        action_value = json.dumps(
+            {"x_account_id": account.id, "draft_id": draft.id},
+            separators=(",", ":"),
+        )
         payload = {
             "text": f"X post ready for review: {review_url}",
             "blocks": [
@@ -155,7 +161,21 @@ class SlackNotifier:
                     "elements": [
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": "Review draft"},
+                            "text": {"type": "plain_text", "text": "Approve"},
+                            "style": "primary",
+                            "action_id": "approve_draft",
+                            "value": action_value,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Reject + regenerate"},
+                            "style": "danger",
+                            "action_id": "reject_draft",
+                            "value": action_value,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Edit in dashboard"},
                             "url": review_url,
                         }
                     ],
@@ -182,11 +202,25 @@ class SlackNotifier:
 
 
 class NotifierManager:
-    def __init__(self, notifiers: list[Notifier]):
+    def __init__(
+        self,
+        notifiers: list[Notifier],
+        *,
+        integrations: IntegrationService | None = None,
+        base_url: str = "",
+        slack_client: httpx.Client | None = None,
+    ):
         self.notifiers = notifiers
+        self.integrations = integrations
+        self.base_url = base_url
+        self.slack_client = slack_client
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "NotifierManager":
+    def from_settings(
+        cls,
+        settings: Settings,
+        integrations: IntegrationService | None = None,
+    ) -> "NotifierManager":
         notifiers: list[Notifier] = [ConsoleNotifier()]
         if settings.telegram_bot_token and settings.telegram_chat_id:
             notifiers.append(
@@ -196,15 +230,36 @@ class NotifierManager:
                     settings.base_url,
                 )
             )
-        if settings.slack_webhook_url:
-            notifiers.append(SlackNotifier(settings.slack_webhook_url, settings.base_url))
-        return cls(notifiers)
+        return cls(
+            notifiers,
+            integrations=integrations,
+            base_url=settings.base_url,
+        )
+
+    def _account_notifiers(self, account: XAccount) -> list[Notifier]:
+        resolved = list(self.notifiers)
+        if self.integrations is None:
+            return resolved
+        try:
+            target = self.integrations.resolve_slack(account.id)
+        except IntegrationError as exc:
+            logger.warning("Slack connection unavailable for account %s: %s", account.id, exc)
+            return resolved
+        if target is not None:
+            resolved.append(
+                SlackNotifier(
+                    target.webhook_url,
+                    self.base_url,
+                    client=self.slack_client,
+                )
+            )
+        return resolved
 
     def notify_for_review(
         self, draft: Draft, account: XAccount, profile: StartupProfile, context: ContentContext
     ) -> list[NotificationResult]:
         results = []
-        for notifier in self.notifiers:
+        for notifier in self._account_notifiers(account):
             try:
                 results.append(notifier.notify_for_review(draft, account, profile, context))
             except Exception as exc:
@@ -219,7 +274,7 @@ class NotifierManager:
 
     def notify_status(self, draft: Draft, account: XAccount, message: str) -> list[NotificationResult]:
         results = []
-        for notifier in self.notifiers:
+        for notifier in self._account_notifiers(account):
             try:
                 results.append(notifier.notify_status(draft, account, message))
             except Exception as exc:

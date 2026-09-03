@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import Settings
 from app.db import Database
 from app.repository import Repository
-from app.routes import api, telegram, ui
+from app.routes import api, slack, telegram, ui
 from app.services.factory import build_services
 from app.services.scheduler import SchedulerService
 
@@ -59,6 +59,7 @@ def create_app(settings: Settings | None = None, start_scheduler: bool | None = 
     app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
     app.include_router(ui.router)
     app.include_router(api.router)
+    app.include_router(slack.router)
     app.include_router(telegram.router)
 
     @app.get("/health")

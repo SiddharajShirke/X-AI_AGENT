@@ -26,21 +26,32 @@ def telegram_webhook(
     callback = payload.get("callback_query") or {}
     callback_id = callback.get("id", "")
     data = callback.get("data", "")
-    if not data or ":" not in data:
+    parts = data.split(":", 2)
+    if len(parts) != 3:
         return {"ok": True, "ignored": True}
-    action, draft_id = data.split(":", 1)
+    action, account_value, draft_id = parts
+    try:
+        x_account_id = int(account_value)
+    except ValueError:
+        return {"ok": True, "ignored": True}
+    user = callback.get("from") or {}
+    reviewer = f"telegram:{user.get('id', '')}:{user.get('username', '')}"
     pipeline = request.app.state.services.pipeline
     message = "Action ignored"
     try:
         if action == "approve":
-            draft = pipeline.approve(draft_id, reviewer="telegram-human")
+            draft = pipeline.approve(
+                x_account_id, draft_id, reviewer=reviewer, origin="telegram"
+            )
             message = f"Draft {draft.status}."
         elif action in {"reject", "regenerate"}:
             replacement = pipeline.reject_and_regenerate(
+                x_account_id,
                 draft_id,
                 reason="other",
                 notes="Rejected from Telegram; generate a materially different post.",
-                reviewer="telegram-human",
+                reviewer=reviewer,
+                origin="telegram",
             )
             message = "Rejected and regenerated." if replacement else "Rejected; guidance required."
     except (PipelineError, KeyError) as exc:

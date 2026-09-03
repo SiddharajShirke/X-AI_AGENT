@@ -35,7 +35,7 @@ def build_services(settings: Settings, repository: Repository) -> Services:
     similarity = SimilarityGuard()
     feedback = FeedbackEngine(repository)
     integrations = IntegrationService(settings, repository)
-    notifiers = NotifierManager.from_settings(settings)
+    notifiers = NotifierManager.from_settings(settings, integrations)
     publishers = PublisherManager(settings)
     pipeline = Pipeline(
         settings,
