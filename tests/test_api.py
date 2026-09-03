@@ -155,7 +155,93 @@ def test_dashboard_renders_configuration_and_review_controls(settings):
         response = client.get("/", headers=_auth())
 
     assert response.status_code == 200
-    assert "Startup profile" in response.text
-    assert "Generate a draft" in response.text
-    assert "Approve" in response.text
-    assert "10 editable posting slots" in response.text
+    assert "Account workspaces" in response.text
+    assert "Add X Account" in response.text
+    assert "Open review workspace" in response.text
+    assert "every post requires an explicit human approval" in response.text
+
+
+def test_accounts_page_shows_status_cards_for_each_account(settings):
+    from app.main import create_app
+
+    with TestClient(create_app(settings=settings, start_scheduler=False)) as client:
+        repository = client.app.state.repository
+        first = repository.list_accounts()[0]
+        second = repository.create_account("Second", "second", "UTC", copy_from_id=first.id)
+
+        response = client.get("/", headers=_auth())
+
+        assert response.status_code == 200
+        assert f"@{first.handle}" in response.text
+        assert f"@{second.handle}" in response.text
+        assert "Slack not connected" in response.text
+        assert "Buffer dry-run" in response.text
+        assert f'href="/accounts/{second.id}"' in response.text
+
+
+def test_account_workspace_names_publish_destination_and_has_csrf(settings):
+    from app.main import create_app
+
+    configured = settings.model_copy(update={"buffer_live_posting": True})
+    with TestClient(create_app(settings=configured, start_scheduler=False)) as client:
+        repository = client.app.state.repository
+        account = repository.list_accounts()[0]
+        repository.update_account(account.id, {"live_posting_enabled": True})
+        client.app.state.services.pipeline.generate_draft(
+            account.id, context_id=repository.list_contexts(account.id)[0].id
+        )
+
+        response = client.get(f"/accounts/{account.id}", headers=_auth())
+
+        assert response.status_code == 200
+        assert f"Approve and publish to @{account.handle}" in response.text
+        assert "LIVE" in response.text
+        assert 'name="csrf_token"' in response.text
+        assert 'content="width=device-width,initial-scale=1"' in response.text
+
+
+def test_setup_page_has_seven_guided_steps_and_reusable_connections(settings):
+    from app.main import create_app
+
+    with TestClient(create_app(settings=settings, start_scheduler=False)) as client:
+        account = client.app.state.repository.list_accounts()[0]
+        response = client.get(f"/accounts/{account.id}/setup", headers=_auth())
+
+        assert response.status_code == 200
+        for number in range(1, 8):
+            assert f"Step {number}" in response.text
+        assert "Reuse a saved Buffer connection" in response.text
+        assert "Reuse a saved Slack connection" in response.text
+        assert "Things never to reveal" in response.text
+
+
+def test_connections_page_masks_all_saved_secrets(settings):
+    from cryptography.fernet import Fernet
+    from app.main import create_app
+
+    configured = settings.model_copy(
+        update={"app_encryption_key": Fernet.generate_key().decode()}
+    )
+    with TestClient(create_app(settings=configured, start_scheduler=False)) as client:
+        service = client.app.state.services.integrations
+        service.save_connection(
+            "buffer", "Founder Buffer", {"api_key": "buffer-private-key"}
+        )
+        service.save_connection(
+            "slack",
+            "Team Slack",
+            {
+                "webhook_url": "https://hooks.slack.test/private-value",
+                "signing_secret": "slack-private-secret",
+            },
+        )
+
+        response = client.get("/connections", headers=_auth())
+
+        assert response.status_code == 200
+        assert "Founder Buffer" in response.text
+        assert "Team Slack" in response.text
+        assert "Configured ••••••••" in response.text
+        assert "buffer-private-key" not in response.text
+        assert "private-value" not in response.text
+        assert "slack-private-secret" not in response.text

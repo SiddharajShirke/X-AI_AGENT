@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}X account workspaces · Startup X Agent{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div><p class="eyebrow">DAILY CONTROL CENTER</p><h1>Account workspaces</h1><p class="lead">Each X account has its own ideas, drafts, feedback, schedules, Buffer destination, and Slack review channel.</p></div>
+  <button type="button" class="primary" data-toggle="add-account">Add X Account</button>
+</section>
+
+<section class="panel add-account" data-add-account hidden>
+  <div class="section-heading"><div><p class="eyebrow">ONE-TIME SETUP</p><h2>Add an independent account</h2></div><button type="button" data-toggle="add-account">Close</button></div>
+  <form action="/ui/accounts" method="post" class="form-grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Workspace name<input name="name" placeholder="Founder account" required></label>
+    <label>X handle<input name="handle" placeholder="your_handle" required></label>
+    <label>Timezone<input name="timezone" value="Asia/Kolkata" required></label>
+    <label>Copy settings from
+      <select name="copy_from_id"><option value="">Start with demo defaults</option>{% for item in accounts %}<option value="{{ item.id }}">@{{ item.handle }}</option>{% endfor %}</select>
+    </label>
+    <p class="wide muted">Copying reuses profile, contexts, and schedule setup only. Drafts, feedback, learning, and integrations stay independent.</p>
+    <div class="wide"><button class="primary" type="submit">Create account workspace</button></div>
+  </form>
+</section>
+
+<section class="account-grid" aria-label="Configured X accounts">
+  {% for item in summaries %}
+  <article class="account-card {% if not item.account.enabled %}is-paused{% endif %}">
+    <div class="card-top">
+      <div><span class="status {% if item.account.enabled %}published{% else %}blocked{% endif %}">{{ "ACTIVE" if item.account.enabled else "PAUSED" }}</span><h2>@{{ item.account.handle }}</h2><p>{{ item.account.name }} · {{ item.profile.domain }}</p></div>
+      <span class="mode-badge {% if item.effective_live %}live{% else %}dry{% endif %}">{{ "LIVE" if item.effective_live else "DRY-RUN" }}</span>
+    </div>
+    <div class="account-metrics"><div><strong>{{ item.pending_count }}</strong><span>Awaiting review</span></div><div><strong>{{ item.published_count }}</strong><span>Published</span></div></div>
+    <ul class="health-list">
+      <li class="{{ item.slack_status|replace(' ', '-') }}">Slack {{ item.slack_status }}</li>
+      <li class="{{ item.buffer_status|replace(' ', '-') }}">{% if not item.effective_live %}Buffer dry-run{% else %}Buffer {{ item.buffer_status }}{% endif %}</li>
+      <li>{% if item.next_schedule %}Next configured slot {{ item.next_schedule.time_local }} · {{ item.account.timezone }}{% else %}No enabled schedule{% endif %}</li>
+    </ul>
+    <div class="card-actions"><a class="button primary" href="/accounts/{{ item.account.id }}">Open review workspace</a><a class="button" href="/accounts/{{ item.account.id }}/setup">Setup</a></div>
+  </article>
+  {% else %}
+  <div class="empty">No accounts yet. Add one to start a fully independent posting workflow.</div>
+  {% endfor %}
+</section>
+{% endblock %}

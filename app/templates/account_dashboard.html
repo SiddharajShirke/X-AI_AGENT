@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}@{{ account.handle }} · Review workspace{% endblock %}
+{% block content %}
+<section class="workspace-hero panel">
+  <div>
+    <p class="eyebrow">CURRENT X DESTINATION</p>
+    <h1>@{{ account.handle }}</h1>
+    <p class="lead">{{ profile.name }} · {{ profile.domain }}</p>
+    {% if not account.enabled %}<p class="alert warning">This account is paused. Generation and review actions are disabled until it is re-enabled in Setup.</p>{% endif %}
+  </div>
+  <div class="workspace-mode">
+    {% set effective_live = settings.buffer_live_posting and account.live_posting_enabled %}
+    <span class="mode-badge {% if effective_live %}live{% else %}dry{% endif %}">{{ "LIVE" if effective_live else "DRY-RUN" }}</span>
+    <p>{% if effective_live %}Approved drafts go to this account's saved Buffer channel.{% else %}Approvals are recorded safely without contacting Buffer.{% endif %}</p>
+  </div>
+</section>
+
+<section class="quick-strip">
+  <div><span>Pending</span><strong>{{ pending|length }}</strong></div>
+  <div><span>Slack</span><strong>{{ slack_status|title }}</strong></div>
+  <div><span>Buffer</span><strong>{{ buffer_status|title }}</strong></div>
+  <div><span>Next slot</span><strong>{% set active_slots = schedules|selectattr('enabled')|list %}{{ active_slots[0].time_local if active_slots else "Not scheduled" }}</strong></div>
+</section>
+
+<section id="review" class="panel focus-panel">
+  <div class="section-heading">
+    <div><p class="eyebrow">TODAY'S MANUAL WORK</p><h2>Review queue</h2><p class="muted">Read, then explicitly approve, edit, or reject. Silence never publishes.</p></div>
+    <form action="/ui/accounts/{{ account.id }}/generate" method="post" class="inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>Idea type<select name="context_id">{% for context in contexts if context.enabled %}<option value="{{ context.id }}">{{ context.name }}</option>{% endfor %}</select></label>
+      <button class="primary" type="submit" {% if not account.enabled %}disabled{% endif %}>Generate one draft</button>
+    </form>
+  </div>
+  {% if not pending %}<div class="empty"><strong>Nothing waiting for review.</strong><br>Generate a draft here, or let the schedule create one automatically.</div>{% endif %}
+  <div class="draft-grid">
+  {% for draft in pending %}
+    <article class="draft-card" id="draft-{{ draft.id }}">
+      <div class="card-meta"><span class="status pending">PENDING</span><span>Attempt {{ draft.attempt }}/{{ profile.max_attempts }}</span><span>Config v{{ draft.config_version }}</span></div>
+      <h3>{{ context_map[draft.context_id].name }}</h3>
+      <p class="post-text" data-post-text>{{ draft.text }}</p>
+      <p class="muted">{{ draft.text|length }}/280 characters · topic: {{ draft.topic }}</p>
+      <form action="/ui/accounts/{{ account.id }}/drafts/{{ draft.id }}/approve" method="post" class="primary-action" data-approve-form data-handle="{{ account.handle }}" data-live="{{ 'true' if effective_live else 'false' }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="approve" type="submit">{% if effective_live %}Approve and publish to @{{ account.handle }}{% else %}Approve in dry-run{% endif %}</button>
+      </form>
+      <details>
+        <summary>Edit before approval</summary>
+        <form action="/ui/accounts/{{ account.id }}/drafts/{{ draft.id }}/edit" method="post" class="stacked-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label>Post text<textarea name="text" maxlength="280" required data-character-count>{{ draft.text }}</textarea><small data-count-output>{{ draft.text|length }}/280</small></label>
+          <label>What changed?<input name="notes" placeholder="Optional learning note"></label>
+          <label class="check"><input type="checkbox" name="approve" value="yes"> Approve after safety is checked again</label>
+          <button type="submit">Save edited version</button>
+        </form>
+      </details>
+      <details>
+        <summary>Reject and teach the agent</summary>
+        <form action="/ui/accounts/{{ account.id }}/drafts/{{ draft.id }}/reject" method="post" class="stacked-form danger-zone" data-reject-form>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label>Reason<select name="reason"><option value="too_generic">Too generic</option><option value="sounds_ai">Sounds AI-generated</option><option value="wrong_topic">Wrong topic</option><option value="too_promotional">Too promotional</option><option value="reveals_too_much">Reveals too much</option><option value="repetitive">Repetitive</option><option value="wrong_tone">Wrong tone</option><option value="other">Other</option></select></label>
+          <label>Feedback<textarea name="notes" placeholder="Example: use a concrete founder observation"></textarea></label>
+          <button class="reject" type="submit">Reject + generate a different draft</button>
+        </form>
+      </details>
+    </article>
+  {% endfor %}
+  </div>
+</section>
+
+{% set failed = drafts|selectattr('status', 'equalto', 'failed')|list %}
+{% if failed %}
+<section class="panel">
+  <p class="eyebrow">ACTION NEEDED</p><h2>Failed publication</h2>
+  {% for draft in failed %}<article class="history-row"><div><span class="status failed">FAILED</span><p>{{ draft.text }}</p><small>{{ draft.error }}</small></div><form action="/ui/accounts/{{ account.id }}/drafts/{{ draft.id }}/retry" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Retry publication</button></form></article>{% endfor %}
+</section>
+{% endif %}
+
+<section class="two-column">
+  <div class="panel" id="connections"><p class="eyebrow">DELIVERY HEALTH</p><h2>Connections</h2><div class="connection-row"><span>Slack review</span><strong class="{{ slack_status|replace(' ', '-') }}">{{ slack_status|title }}</strong></div><div class="connection-row"><span>Buffer publishing</span><strong class="{{ buffer_status|replace(' ', '-') }}">{{ buffer_status|title }}</strong></div><a class="button" href="/accounts/{{ account.id }}/setup#connections">Fix or reuse connections</a></div>
+  <div class="panel"><p class="eyebrow">SCHEDULE</p><h2>Automatic draft creation</h2>{% set active_slots = schedules|selectattr('enabled')|list %}{% if active_slots %}<p class="lead">Next configured time: {{ active_slots[0].time_local }}</p><p class="muted">Times use {{ account.timezone }}. Generated drafts still wait for approval.</p>{% else %}<p class="empty">No schedule enabled.</p>{% endif %}<a class="button" href="/accounts/{{ account.id }}/setup#schedule">Edit schedule</a></div>
+</section>
+
+<section class="panel">
+  <div class="section-heading"><div><p class="eyebrow">ACCOUNT-ONLY HISTORY</p><h2>Recent outcomes</h2></div><a href="/accounts/{{ account.id }}/setup#learning">View learning</a></div>
+  <div class="history-list">{% for draft in drafts if draft.status != 'pending' %}<article class="history-row"><div><span class="status {{ draft.status }}">{{ draft.status }}</span><p>{{ draft.text }}</p><small>Attempt {{ draft.attempt }} · {{ draft.created_at }}</small></div>{% if draft.post_url %}<a href="{{ draft.post_url }}" rel="noreferrer">Open post</a>{% endif %}</article>{% else %}<div class="empty">No completed reviews yet.</div>{% endfor %}</div>
+</section>
+{% endblock %}

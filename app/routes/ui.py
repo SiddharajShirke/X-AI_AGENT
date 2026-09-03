@@ -43,6 +43,10 @@ def _dashboard_context(request: Request, repository: Repository, x_account_id: i
     context_map = {context.id: context for context in contexts}
     schedules = repository.list_schedules(x_account_id)
     drafts = repository.list_drafts(x_account_id, limit=80)
+    buffer_binding = repository.get_account_integration(x_account_id, "buffer")
+    slack_binding = repository.get_account_integration(x_account_id, "slack")
+    buffer_status = _connection_status(request, x_account_id, "buffer")
+    slack_status = _connection_status(request, x_account_id, "slack")
     return {
         "account": account,
         "accounts": repository.list_accounts(),
@@ -63,10 +67,32 @@ def _dashboard_context(request: Request, repository: Repository, x_account_id: i
         "feedback": repository.list_feedback(x_account_id, limit=20),
         "versions": repository.list_config_versions(x_account_id, limit=8),
         "events": repository.list_events(x_account_id, limit=20),
+        "buffer_binding": buffer_binding,
+        "slack_binding": slack_binding,
+        "buffer_status": buffer_status,
+        "slack_status": slack_status,
+        "buffer_connections": repository.list_integration_connections("buffer"),
+        "slack_connections": repository.list_integration_connections("slack"),
         "settings": request.app.state.settings,
         "csrf_token": request.app.state.csrf.issue(reviewer),
         "message": request.query_params.get("message", ""),
     }
+
+
+def _connection_status(request: Request, x_account_id: int, provider: str) -> str:
+    binding = request.app.state.repository.get_account_integration(
+        x_account_id, provider
+    )
+    if binding is None or not binding.enabled:
+        return "not connected"
+    try:
+        if provider == "buffer":
+            target = request.app.state.services.integrations.resolve_buffer(x_account_id)
+        else:
+            target = request.app.state.services.integrations.resolve_slack(x_account_id)
+    except IntegrationError:
+        return "locked"
+    return "connected" if target is not None else "not connected"
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -78,10 +104,37 @@ def dashboard(
     accounts = repository.list_accounts()
     if not accounts:
         raise HTTPException(status_code=404, detail="No X accounts configured")
+    summaries = []
+    for account in accounts:
+        drafts = repository.list_drafts(account.id, limit=100)
+        enabled_schedules = [
+            slot for slot in repository.list_schedules(account.id) if slot.enabled
+        ]
+        summaries.append(
+            {
+                "account": account,
+                "profile": repository.get_profile(account.id),
+                "pending_count": sum(draft.status == "pending" for draft in drafts),
+                "published_count": sum(draft.status == "published" for draft in drafts),
+                "next_schedule": enabled_schedules[0] if enabled_schedules else None,
+                "slack_status": _connection_status(request, account.id, "slack"),
+                "buffer_status": _connection_status(request, account.id, "buffer"),
+                "effective_live": (
+                    request.app.state.settings.buffer_live_posting
+                    and account.live_posting_enabled
+                ),
+            }
+        )
     return templates.TemplateResponse(
         request=request,
-        name="dashboard.html",
-        context=_dashboard_context(request, repository, accounts[0].id, reviewer),
+        name="accounts.html",
+        context={
+            "accounts": accounts,
+            "summaries": summaries,
+            "settings": request.app.state.settings,
+            "csrf_token": request.app.state.csrf.issue(reviewer),
+            "message": request.query_params.get("message", ""),
+        },
     )
 
 
@@ -97,7 +150,46 @@ def account_dashboard(
     except (KeyError, RuntimeError) as exc:
         _form_error(exc)
     return templates.TemplateResponse(
-        request=request, name="dashboard.html", context=context
+        request=request, name="account_dashboard.html", context=context
+    )
+
+
+@router.get("/accounts/{x_account_id}/setup", response_class=HTMLResponse)
+def account_setup(
+    x_account_id: int,
+    request: Request,
+    reviewer: str = Depends(require_admin),
+    repository: Repository = Depends(get_repository),
+):
+    try:
+        context = _dashboard_context(request, repository, x_account_id, reviewer)
+    except (KeyError, RuntimeError) as exc:
+        _form_error(exc)
+    return templates.TemplateResponse(
+        request=request, name="account_setup.html", context=context
+    )
+
+
+@router.get("/connections", response_class=HTMLResponse)
+def connections_dashboard(
+    request: Request,
+    reviewer: str = Depends(require_admin),
+    repository: Repository = Depends(get_repository),
+):
+    accounts = repository.list_accounts()
+    requested = request.query_params.get("account_id")
+    return_account_id = int(requested) if requested and requested.isdigit() else accounts[0].id
+    return templates.TemplateResponse(
+        request=request,
+        name="connections.html",
+        context={
+            "accounts": accounts,
+            "connections": repository.list_integration_connections(),
+            "return_account_id": return_account_id,
+            "settings": request.app.state.settings,
+            "csrf_token": request.app.state.csrf.issue(reviewer),
+            "message": request.query_params.get("message", ""),
+        },
     )
 
 
