@@ -6,6 +6,7 @@ from app.config import Settings
 from app.repository import Repository
 from app.services.feedback import FeedbackEngine
 from app.services.generation import ContentGenerator
+from app.services.integrations import IntegrationService
 from app.services.notifiers import NotifierManager
 from app.services.pipeline import Pipeline
 from app.services.publishers import PublisherManager
@@ -24,6 +25,7 @@ class Services:
     feedback_engine: FeedbackEngine
     notifiers: NotifierManager
     publishers: PublisherManager
+    integrations: IntegrationService
 
 
 def build_services(settings: Settings, repository: Repository) -> Services:
@@ -32,6 +34,7 @@ def build_services(settings: Settings, repository: Repository) -> Services:
     safety = SafetyGuard()
     similarity = SimilarityGuard()
     feedback = FeedbackEngine(repository)
+    integrations = IntegrationService(settings, repository)
     notifiers = NotifierManager.from_settings(settings)
     publishers = PublisherManager(settings)
     pipeline = Pipeline(
@@ -54,4 +57,5 @@ def build_services(settings: Settings, repository: Repository) -> Services:
         feedback_engine=feedback,
         notifiers=notifiers,
         publishers=publishers,
+        integrations=integrations,
     )

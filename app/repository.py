@@ -884,6 +884,49 @@ class Repository:
             raise KeyError(f"Unknown integration connection: {connection_id}")
         return str(row["encrypted_credentials"])
 
+    def get_integration_connection(self, connection_id: int) -> IntegrationConnection:
+        with self.database.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, provider, label,
+                       encrypted_credentials != '' AS credentials_configured,
+                       created_at, updated_at
+                FROM integration_connections WHERE id = ?
+                """,
+                (connection_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown integration connection: {connection_id}")
+        return _connection_from_row(row)
+
+    def replace_integration_connection(
+        self,
+        connection_id: int,
+        *,
+        provider: str,
+        label: str,
+        encrypted_credentials: str,
+    ) -> IntegrationConnection:
+        now = utc_now_iso()
+        with self.database.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE integration_connections
+                SET label = ?, encrypted_credentials = ?, updated_at = ?
+                WHERE id = ? AND provider = ?
+                """,
+                (
+                    str(label).strip(),
+                    str(encrypted_credentials),
+                    now,
+                    connection_id,
+                    str(provider).strip().lower(),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Unknown {provider} integration connection: {connection_id}")
+        return self.get_integration_connection(connection_id)
+
     def bind_account_integration(
         self,
         x_account_id: int,
@@ -941,3 +984,52 @@ class Repository:
                 (x_account_id, str(provider).strip().lower()),
             ).fetchone()
         return _binding_from_row(row) if row is not None else None
+
+    def record_integration_test(
+        self,
+        x_account_id: int,
+        provider: str,
+        *,
+        success: bool,
+        error: str = "",
+    ) -> AccountIntegration:
+        normalized_provider = str(provider).strip().lower()
+        with self.database.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE account_integrations
+                SET last_test_success = ?, last_test_error = ?, last_tested_at = ?
+                WHERE x_account_id = ? AND provider = ?
+                """,
+                (
+                    int(bool(success)),
+                    str(error),
+                    utc_now_iso(),
+                    x_account_id,
+                    normalized_provider,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(
+                    f"Unknown {normalized_provider} integration for account {x_account_id}"
+                )
+        binding = self.get_account_integration(x_account_id, normalized_provider)
+        if binding is None:
+            raise KeyError(
+                f"Unknown {normalized_provider} integration for account {x_account_id}"
+            )
+        return binding
+
+    def disconnect_account_integration(
+        self, x_account_id: int, provider: str
+    ) -> AccountIntegration | None:
+        normalized_provider = str(provider).strip().lower()
+        with self.database.connection() as conn:
+            conn.execute(
+                """
+                UPDATE account_integrations SET enabled = 0
+                WHERE x_account_id = ? AND provider = ?
+                """,
+                (x_account_id, normalized_provider),
+            )
+        return self.get_account_integration(x_account_id, normalized_provider)
