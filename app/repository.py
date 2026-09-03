@@ -206,14 +206,22 @@ class Repository:
                     (normalized_name, normalized_handle, normalized_timezone, now, now),
                 )
                 x_account_id = int(cursor.lastrowid)
-                if copy_from_id is not None:
-                    self._copy_account_configuration(
-                        conn,
-                        source_account_id=copy_from_id,
-                        target_account_id=x_account_id,
-                        target_timezone=normalized_timezone,
-                        created_at=now,
-                    )
+                source_account_id = copy_from_id
+                if source_account_id is None:
+                    source = conn.execute(
+                        "SELECT id FROM x_accounts WHERE id != ? ORDER BY id LIMIT 1",
+                        (x_account_id,),
+                    ).fetchone()
+                    if source is None:
+                        raise RuntimeError("No default account configuration is available")
+                    source_account_id = int(source["id"])
+                self._copy_account_configuration(
+                    conn,
+                    source_account_id=source_account_id,
+                    target_account_id=x_account_id,
+                    target_timezone=normalized_timezone,
+                    created_at=now,
+                )
         except sqlite3.IntegrityError as exc:
             if "x_accounts.handle" in str(exc):
                 raise ValueError(f"X account handle already exists: {normalized_handle}") from exc
@@ -666,6 +674,37 @@ class Repository:
             conn.execute(
                 f"UPDATE drafts SET {columns} WHERE x_account_id = ? AND id = ?", params
             )
+        return self.get_draft(x_account_id, draft_id)
+
+    def transition_draft(
+        self,
+        x_account_id: int,
+        draft_id: str,
+        *,
+        from_status: str,
+        to_status: str,
+        **updates: Any,
+    ) -> Draft | None:
+        allowed = {
+            "text", "topic", "source_summary", "safety_status",
+            "similarity_score", "expires_at", "prompt_snapshot",
+            "rejection_reason", "reviewer_notes", "reviewer", "approved_at",
+            "published_at", "publisher_provider", "external_post_id",
+            "post_url", "error",
+        }
+        invalid = set(updates) - allowed
+        if invalid:
+            raise ValueError(f"Unsupported draft fields: {sorted(invalid)}")
+        assignments = ["status = ?", *(f"{field} = ?" for field in updates)]
+        params = [to_status, *updates.values(), x_account_id, str(draft_id), from_status]
+        with self.database.connection() as conn:
+            cursor = conn.execute(
+                f"UPDATE drafts SET {', '.join(assignments)} "
+                "WHERE x_account_id = ? AND id = ? AND status = ?",
+                params,
+            )
+            if cursor.rowcount != 1:
+                return None
         return self.get_draft(x_account_id, draft_id)
 
     def list_drafts(

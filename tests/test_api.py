@@ -198,6 +198,7 @@ def test_account_workspace_names_publish_destination_and_has_csrf(settings):
         assert "LIVE" in response.text
         assert 'name="csrf_token"' in response.text
         assert 'content="width=device-width,initial-scale=1"' in response.text
+        assert 'data-edit-form' in response.text
 
 
 def test_setup_page_has_seven_guided_steps_and_reusable_connections(settings):
@@ -245,3 +246,47 @@ def test_connections_page_masks_all_saved_secrets(settings):
         assert "buffer-private-key" not in response.text
         assert "private-value" not in response.text
         assert "slack-private-secret" not in response.text
+
+
+def test_account_without_copy_source_is_immediately_usable(settings):
+    from app.main import create_app
+
+    with TestClient(create_app(settings=settings, start_scheduler=False)) as client:
+        response = client.post(
+            "/api/accounts",
+            headers=_auth(),
+            json={"name": "Fresh", "handle": "fresh", "timezone": "UTC"},
+        )
+        account_id = response.json()["id"]
+        overview = client.get("/", headers=_auth())
+        setup = client.get(f"/accounts/{account_id}/setup", headers=_auth())
+
+        assert response.status_code == 201
+        assert overview.status_code == 200
+        assert setup.status_code == 200
+        assert "@fresh" in overview.text
+        assert len(client.app.state.repository.list_contexts(account_id)) == 10
+
+
+def test_telegram_actions_are_disabled_without_webhook_secret(settings):
+    from app.main import create_app
+
+    with TestClient(create_app(settings=settings, start_scheduler=False)) as client:
+        repository = client.app.state.repository
+        account = repository.list_accounts()[0]
+        draft = client.app.state.services.pipeline.generate_draft(
+            account.id, context_id=repository.list_contexts(account.id)[0].id
+        )
+        response = client.post(
+            "/integrations/telegram/webhook",
+            json={
+                "callback_query": {
+                    "id": "callback",
+                    "from": {"id": 123, "username": "forged"},
+                    "data": f"approve:{account.id}:{draft.id}",
+                }
+            },
+        )
+
+        assert response.status_code == 403
+        assert repository.get_draft(account.id, draft.id).status == "pending"

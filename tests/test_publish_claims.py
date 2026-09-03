@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event, Lock
+from threading import Event, Lock, Thread, current_thread
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from cryptography.fernet import Fernet
@@ -214,3 +215,96 @@ def test_published_draft_refuses_retry(pipeline, repository, x_account):
 
     with pytest.raises(PipelineError, match="failed"):
         pipeline.retry_publish(x_account.id, published.id, reviewer="admin")
+
+
+@pytest.mark.parametrize("competing_action", ["reject", "edit"])
+def test_stale_review_action_cannot_overwrite_active_publication(
+    pipeline, repository, x_account, monkeypatch, competing_action
+):
+    started = Event()
+    release_publisher = Event()
+    stale_read = Event()
+    release_competitor = Event()
+
+    class BlockingPublisher(RecordingPublisher):
+        def publish(self, draft, account, target):
+            with self._lock:
+                self.calls += 1
+            started.set()
+            assert release_publisher.wait(timeout=5)
+            return PublishResult(success=True, provider="dry_run")
+
+    draft = _pending(pipeline, repository, x_account.id)
+    original_get_draft = repository.get_draft
+    delayed_once = False
+
+    def delayed_get_draft(account_id, draft_id):
+        nonlocal delayed_once
+        result = original_get_draft(account_id, draft_id)
+        if current_thread().name == "competing-review" and not delayed_once:
+            delayed_once = True
+            stale_read.set()
+            assert release_competitor.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(repository, "get_draft", delayed_get_draft)
+    pipeline.publishers = BlockingPublisher()
+    errors: list[Exception] = []
+
+    def compete():
+        try:
+            if competing_action == "reject":
+                pipeline.reject_and_regenerate(
+                    x_account.id,
+                    draft.id,
+                    reason="too_generic",
+                    reviewer="competitor",
+                )
+            else:
+                pipeline.edit(
+                    x_account.id,
+                    draft.id,
+                    "A concrete and materially different human edit.",
+                    reviewer="competitor",
+                )
+        except Exception as exc:
+            errors.append(exc)
+
+    competing = Thread(target=compete, name="competing-review")
+    competing.start()
+    assert stale_read.wait(timeout=5)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        approval = executor.submit(
+            pipeline.approve, x_account.id, draft.id, reviewer="approver"
+        )
+        assert started.wait(timeout=5)
+        release_competitor.set()
+        competing.join(timeout=5)
+        release_publisher.set()
+        approved = approval.result(timeout=5)
+
+    assert approved.status == "published"
+    assert len(errors) == 1
+    assert isinstance(errors[0], PipelineError)
+    assert pipeline.publishers.calls == 1
+
+
+def test_stale_timeout_result_cannot_overwrite_published_draft(
+    pipeline, repository, x_account, monkeypatch
+):
+    draft = _pending(pipeline, repository, x_account.id)
+    stale_expired_query = [draft]
+    approved = pipeline.approve(x_account.id, draft.id, reviewer="admin")
+    monkeypatch.setattr(
+        repository,
+        "pending_expired_before",
+        lambda account_id, cutoff: stale_expired_query,
+    )
+
+    replacements = pipeline.expire_and_regenerate(
+        datetime.now(timezone.utc) + timedelta(days=1), x_account_id=x_account.id
+    )
+
+    assert approved.status == "published"
+    assert replacements == []
+    assert repository.get_draft(x_account.id, draft.id).status == "published"

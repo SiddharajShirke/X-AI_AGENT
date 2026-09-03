@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -18,9 +19,10 @@ def telegram_webhook(
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ):
     settings = request.app.state.settings
-    if settings.telegram_webhook_secret and (
-        x_telegram_bot_api_secret_token != settings.telegram_webhook_secret
-    ):
+    if not settings.telegram_webhook_secret:
+        raise HTTPException(status_code=403, detail="Telegram webhook is not configured")
+    supplied = x_telegram_bot_api_secret_token or ""
+    if not secrets.compare_digest(supplied, settings.telegram_webhook_secret):
         raise HTTPException(status_code=403, detail="Invalid Telegram webhook secret")
 
     callback = payload.get("callback_query") or {}

@@ -45,11 +45,11 @@
       </form>
       <details>
         <summary>Edit before approval</summary>
-        <form action="/ui/accounts/{{ account.id }}/drafts/{{ draft.id }}/edit" method="post" class="stacked-form">
+        <form action="/ui/accounts/{{ account.id }}/drafts/{{ draft.id }}/edit" method="post" class="stacked-form" data-edit-form data-handle="{{ account.handle }}" data-live="{{ 'true' if effective_live else 'false' }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <label>Post text<textarea name="text" maxlength="280" required data-character-count>{{ draft.text }}</textarea><small data-count-output>{{ draft.text|length }}/280</small></label>
           <label>What changed?<input name="notes" placeholder="Optional learning note"></label>
-          <label class="check"><input type="checkbox" name="approve" value="yes"> Approve after safety is checked again</label>
+          <label class="check"><input type="checkbox" name="approve" value="yes"> {% if effective_live %}Approve and publish this edit to @{{ account.handle }}{% else %}Approve this edit in dry-run{% endif %}</label>
           <button type="submit">Save edited version</button>
         </form>
       </details>
@@ -71,7 +71,7 @@
 {% if failed %}
 <section class="panel">
   <p class="eyebrow">ACTION NEEDED</p><h2>Failed publication</h2>
-  {% for draft in failed %}<article class="history-row"><div><span class="status failed">FAILED</span><p>{{ draft.text }}</p><small>{{ draft.error }}</small></div><form action="/ui/accounts/{{ account.id }}/drafts/{{ draft.id }}/retry" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Retry publication</button></form></article>{% endfor %}
+  {% for draft in failed %}<article class="history-row"><div><span class="status failed">FAILED</span><p data-post-text>{{ draft.text }}</p><small>{{ draft.error }}</small></div><form action="/ui/accounts/{{ account.id }}/drafts/{{ draft.id }}/retry" method="post" data-approve-form data-handle="{{ account.handle }}" data-live="{{ 'true' if effective_live else 'false' }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Retry publication to @{{ account.handle }}</button></form></article>{% endfor %}
 </section>
 {% endif %}
 

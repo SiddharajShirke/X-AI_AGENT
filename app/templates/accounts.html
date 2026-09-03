@@ -14,7 +14,7 @@
     <label>X handle<input name="handle" placeholder="your_handle" required></label>
     <label>Timezone<input name="timezone" value="Asia/Kolkata" required></label>
     <label>Copy settings from
-      <select name="copy_from_id"><option value="">Start with demo defaults</option>{% for item in accounts %}<option value="{{ item.id }}">@{{ item.handle }}</option>{% endfor %}</select>
+      <select name="copy_from_id"><option value="">Use primary account setup</option>{% for item in accounts %}<option value="{{ item.id }}">@{{ item.handle }}</option>{% endfor %}</select>
     </label>
     <p class="wide muted">Copying reuses profile, contexts, and schedule setup only. Drafts, feedback, learning, and integrations stay independent.</p>
     <div class="wide"><button class="primary" type="submit">Create account workspace</button></div>

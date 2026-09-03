@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import time
 from urllib.parse import urlencode
 
@@ -103,6 +104,7 @@ def test_slack_review_message_contains_account_actions_and_edit_link(repository)
         "https://hooks.slack.test/review",
         "https://review.example",
         client=httpx.Client(transport=httpx.MockTransport(handler)),
+        live_posting=True,
     )
 
     result = notifier.notify_for_review(draft, account, profile, context)
@@ -110,6 +112,8 @@ def test_slack_review_message_contains_account_actions_and_edit_link(repository)
     assert result.success is True
     payload = json.loads(captured_requests[0].content)
     assert f"@{account.handle}" in str(payload)
+    assert "LIVE via Buffer" in str(payload)
+    assert draft.topic in str(payload)
     actions = next(
         block["elements"] for block in payload["blocks"] if block["type"] == "actions"
     )
@@ -117,6 +121,7 @@ def test_slack_review_message_contains_account_actions_and_edit_link(repository)
         "approve_draft",
         "reject_draft",
     }
+    assert f"publish to @{account.handle}" in actions[0]["text"]["text"]
     edit = next(item for item in actions if item.get("url"))
     assert edit["url"] == (
         f"https://review.example/accounts/{account.id}#draft-{draft.id}"
@@ -182,6 +187,47 @@ def test_notifier_manager_resolves_each_accounts_saved_slack_connection(
     assert [request.url.path for request in captured] == ["/first", "/second"]
     assert f"@{first.handle}" in captured[0].content.decode()
     assert f"@{second.handle}" in captured[1].content.decode()
+
+
+def test_slack_delivery_failure_never_persists_or_logs_webhook_secret(
+    settings, repository, caplog
+):
+    configured = _configured_settings(settings)
+    secret_path = "services/SECRET/TOKEN"
+    integrations = IntegrationService(configured, repository)
+    account = repository.list_accounts()[0]
+    connection = integrations.save_connection(
+        "slack",
+        "Failing Slack",
+        {
+            "webhook_url": f"https://hooks.slack.test/{secret_path}",
+            "signing_secret": "signing-secret",
+        },
+    )
+    integrations.bind(account.id, "slack", connection.id, "review")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="forbidden", request=request)
+
+    manager = NotifierManager(
+        [ConsoleNotifier()],
+        integrations=integrations,
+        base_url=configured.base_url,
+        slack_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        buffer_live_posting=False,
+    )
+    from app.services.factory import build_services
+
+    pipeline = build_services(configured, repository).pipeline
+    pipeline.notifiers = manager
+    caplog.set_level(logging.INFO)
+
+    pipeline.generate_draft(
+        account.id, context_id=repository.list_contexts(account.id)[0].id
+    )
+
+    assert secret_path not in str(repository.list_events(account.id))
+    assert secret_path not in caplog.text
 
 
 def test_valid_slack_approve_and_repeat_publish_once(settings):

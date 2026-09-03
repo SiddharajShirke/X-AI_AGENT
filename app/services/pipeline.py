@@ -178,14 +178,17 @@ class Pipeline:
         profile = self.repository.get_profile(x_account_id)
         safety = self.safety_guard.check(draft.text, profile)
         if not safety.safe:
-            blocked = self.repository.update_draft(
+            blocked = self.repository.transition_draft(
                 x_account_id,
                 draft.id,
-                status="blocked",
+                from_status="pending",
+                to_status="blocked",
                 safety_status="blocked",
                 error="; ".join(safety.reasons),
                 reviewer=reviewer,
             )
+            if blocked is None:
+                return self.repository.get_draft(x_account_id, draft.id)
             self.repository.log_event(
                 x_account_id,
                 "approval_blocked_by_safety",
@@ -281,14 +284,16 @@ class Pipeline:
         profile = self.repository.get_profile(x_account_id)
         safety = self.safety_guard.check(draft.text, profile)
         if not safety.safe:
-            return self.repository.update_draft(
+            blocked = self.repository.transition_draft(
                 x_account_id,
                 draft.id,
-                status="blocked",
+                from_status="failed",
+                to_status="blocked",
                 safety_status="blocked",
                 error="; ".join(safety.reasons),
                 reviewer=reviewer,
             )
+            return blocked or self.repository.get_draft(x_account_id, draft.id)
         claimed = self.repository.claim_publish(
             x_account_id,
             draft.id,
@@ -319,6 +324,20 @@ class Pipeline:
         draft = self.repository.get_draft(x_account_id, draft_id)
         if draft.status != "pending":
             raise PipelineError(f"Only pending drafts can be rejected; status is {draft.status}")
+        claimed = self.repository.transition_draft(
+            x_account_id,
+            draft.id,
+            from_status="pending",
+            to_status="rejecting",
+            reviewer=reviewer,
+            expires_at=None,
+        )
+        if claimed is None:
+            current = self.repository.get_draft(x_account_id, draft.id)
+            raise PipelineError(
+                f"Only pending drafts can be rejected; status is {current.status}"
+            )
+        draft = claimed
         self.feedback_engine.record_rejection(
             draft,
             reason=reason,
@@ -327,10 +346,11 @@ class Pipeline:
         )
         profile = self.repository.get_profile(x_account_id)
         if draft.attempt >= profile.max_attempts:
-            self.repository.update_draft(
+            self.repository.transition_draft(
                 x_account_id,
                 draft.id,
-                status="needs_guidance",
+                from_status="rejecting",
+                to_status="needs_guidance",
                 rejection_reason=reason,
                 reviewer_notes=notes,
                 reviewer=reviewer,
@@ -348,10 +368,11 @@ class Pipeline:
             )
             return None
 
-        self.repository.update_draft(
+        self.repository.transition_draft(
             x_account_id,
             draft.id,
-            status="rejected",
+            from_status="rejecting",
+            to_status="rejected",
             rejection_reason=reason,
             reviewer_notes=notes,
             reviewer=reviewer,
@@ -401,6 +422,18 @@ class Pipeline:
                 x_account_id, limit=100, exclude_id=draft.id
             ),
         )
+        claimed = self.repository.transition_draft(
+            x_account_id,
+            draft.id,
+            from_status="pending",
+            to_status="editing",
+        )
+        if claimed is None:
+            current = self.repository.get_draft(x_account_id, draft.id)
+            raise PipelineError(
+                f"Only pending drafts can be edited; status is {current.status}"
+            )
+        draft = claimed
         if not safety.safe or not similarity.unique:
             blocked = self.repository.create_draft(
                 x_account_id,
@@ -437,6 +470,12 @@ class Pipeline:
                     "origin": "dashboard",
                 },
             )
+            self.repository.transition_draft(
+                x_account_id,
+                draft.id,
+                from_status="editing",
+                to_status="pending",
+            )
             return self.repository.get_draft(x_account_id, blocked.id)
 
         self.feedback_engine.record_edit(
@@ -445,10 +484,11 @@ class Pipeline:
             reviewer=reviewer,
             notes=notes,
         )
-        self.repository.update_draft(
+        self.repository.transition_draft(
             x_account_id,
             draft.id,
-            status="rejected",
+            from_status="editing",
+            to_status="rejected",
             rejection_reason="edited",
             reviewer_notes=notes,
             reviewer=reviewer,
@@ -509,6 +549,16 @@ class Pipeline:
         for account in accounts:
             profile = self.repository.get_profile(account.id)
             for draft in self.repository.pending_expired_before(account.id, cutoff):
+                claimed = self.repository.transition_draft(
+                    account.id,
+                    draft.id,
+                    from_status="pending",
+                    to_status="expiring",
+                    expires_at=None,
+                )
+                if claimed is None:
+                    continue
+                draft = claimed
                 self.feedback_engine.record_rejection(
                     draft,
                     reason="timeout",
@@ -517,19 +567,21 @@ class Pipeline:
                     decision="expired",
                 )
                 if draft.attempt >= profile.max_attempts:
-                    self.repository.update_draft(
+                    self.repository.transition_draft(
                         account.id,
                         draft.id,
-                        status="needs_guidance",
+                        from_status="expiring",
+                        to_status="needs_guidance",
                         rejection_reason="timeout",
                         reviewer_notes="Approval timeout and attempt limit reached.",
                         expires_at=None,
                     )
                     continue
-                self.repository.update_draft(
+                self.repository.transition_draft(
                     account.id,
                     draft.id,
-                    status="expired",
+                    from_status="expiring",
+                    to_status="expired",
                     rejection_reason="timeout",
                     reviewer_notes="No explicit approval received.",
                     expires_at=None,

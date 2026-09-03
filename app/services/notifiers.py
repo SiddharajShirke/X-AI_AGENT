@@ -11,6 +11,7 @@ from app.models import ContentContext, Draft, NotificationResult, StartupProfile
 from app.services.integrations import IntegrationError, IntegrationService
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class Notifier(Protocol):
@@ -107,7 +108,10 @@ class TelegramNotifier:
                 )
             return NotificationResult(success=True, provider="telegram")
         except Exception as exc:
-            return NotificationResult(success=False, provider="telegram", error=str(exc))
+            logger.warning("Telegram review notification failed: %s", type(exc).__name__)
+            return NotificationResult(
+                success=False, provider="telegram", error="Telegram notification failed"
+            )
 
     def notify_status(self, draft: Draft, account: XAccount, message: str) -> NotificationResult:
         try:
@@ -121,19 +125,36 @@ class TelegramNotifier:
             response.raise_for_status()
             return NotificationResult(success=True, provider="telegram")
         except Exception as exc:
-            return NotificationResult(success=False, provider="telegram", error=str(exc))
+            logger.warning("Telegram status notification failed: %s", type(exc).__name__)
+            return NotificationResult(
+                success=False, provider="telegram", error="Telegram notification failed"
+            )
 
 
 class SlackNotifier:
-    def __init__(self, webhook_url: str, base_url: str, client: httpx.Client | None = None):
+    def __init__(
+        self,
+        webhook_url: str,
+        base_url: str,
+        client: httpx.Client | None = None,
+        *,
+        live_posting: bool = False,
+    ):
         self.webhook_url = webhook_url
         self.base_url = base_url.rstrip("/")
         self.client = client or httpx.Client(timeout=10.0)
+        self.live_posting = live_posting
 
     def notify_for_review(
         self, draft: Draft, account: XAccount, profile: StartupProfile, context: ContentContext
     ) -> NotificationResult:
         review_url = f"{self.base_url}/accounts/{account.id}#draft-{draft.id}"
+        mode = "LIVE via Buffer" if self.live_posting else "DRY-RUN"
+        approve_label = (
+            f"Approve & publish to @{account.handle}"
+            if self.live_posting
+            else "Approve in dry-run"
+        )
         action_value = json.dumps(
             {"x_account_id": account.id, "draft_id": draft.id},
             separators=(",", ":"),
@@ -152,7 +173,9 @@ class SlackNotifier:
                         "text": (
                             f"*Account:* {profile.name} (@{account.handle})\n"
                             f"*Context:* {context.name}\n"
+                            f"*Topic:* {draft.topic}\n"
                             f"*Attempt:* {draft.attempt}\n\n{draft.text}"
+                            f"\n\n*Mode:* {mode} · *Destination:* @{account.handle}"
                         ),
                     },
                 },
@@ -161,7 +184,7 @@ class SlackNotifier:
                     "elements": [
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": "Approve"},
+                            "text": {"type": "plain_text", "text": approve_label},
                             "style": "primary",
                             "action_id": "approve_draft",
                             "value": action_value,
@@ -187,7 +210,10 @@ class SlackNotifier:
             response.raise_for_status()
             return NotificationResult(success=True, provider="slack")
         except Exception as exc:
-            return NotificationResult(success=False, provider="slack", error=str(exc))
+            logger.warning("Slack review notification failed: %s", type(exc).__name__)
+            return NotificationResult(
+                success=False, provider="slack", error="Slack notification failed"
+            )
 
     def notify_status(self, draft: Draft, account: XAccount, message: str) -> NotificationResult:
         try:
@@ -198,7 +224,10 @@ class SlackNotifier:
             response.raise_for_status()
             return NotificationResult(success=True, provider="slack")
         except Exception as exc:
-            return NotificationResult(success=False, provider="slack", error=str(exc))
+            logger.warning("Slack status notification failed: %s", type(exc).__name__)
+            return NotificationResult(
+                success=False, provider="slack", error="Slack notification failed"
+            )
 
 
 class NotifierManager:
@@ -209,11 +238,13 @@ class NotifierManager:
         integrations: IntegrationService | None = None,
         base_url: str = "",
         slack_client: httpx.Client | None = None,
+        buffer_live_posting: bool = False,
     ):
         self.notifiers = notifiers
         self.integrations = integrations
         self.base_url = base_url
         self.slack_client = slack_client
+        self.buffer_live_posting = buffer_live_posting
 
     @classmethod
     def from_settings(
@@ -234,6 +265,7 @@ class NotifierManager:
             notifiers,
             integrations=integrations,
             base_url=settings.base_url,
+            buffer_live_posting=settings.buffer_live_posting,
         )
 
     def _account_notifiers(self, account: XAccount) -> list[Notifier]:
@@ -251,6 +283,9 @@ class NotifierManager:
                     target.webhook_url,
                     self.base_url,
                     client=self.slack_client,
+                    live_posting=(
+                        self.buffer_live_posting and account.live_posting_enabled
+                    ),
                 )
             )
         return resolved

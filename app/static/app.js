@@ -31,6 +31,16 @@ document.querySelectorAll('[data-approve-form]').forEach((form) => {
   });
 });
 
+document.querySelectorAll('[data-edit-form]').forEach((form) => {
+  form.addEventListener('submit', (event) => {
+    const approve = form.querySelector('input[name="approve"]');
+    if (!approve?.checked || form.dataset.live !== 'true') return;
+    const text = form.querySelector('textarea[name="text"]')?.value?.trim() || '';
+    const prompt = `Publish this edited post to @${form.dataset.handle}?\n\n${text}`;
+    if (!window.confirm(prompt)) event.preventDefault();
+  });
+});
+
 document.querySelectorAll('[data-character-count]').forEach((field) => {
   const output = field.parentElement?.querySelector('[data-count-output]');
   const render = () => { if (output) output.textContent = `${field.value.length}/280`; };
