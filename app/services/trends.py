@@ -28,14 +28,14 @@ class TrendCollector:
         self.settings = settings
         self.repository = repository
 
-    def collect(self, profile: StartupProfile) -> list[TrendItem]:
-        items = self.repository.list_trends(limit=8)
+    def collect(self, x_account_id: int, profile: StartupProfile) -> list[TrendItem]:
+        items = self.repository.list_trends(x_account_id, limit=8)
         if self.settings.twitter_bearer_token:
-            items.extend(self._x_recent_items(profile))
+            items.extend(self._x_recent_items(x_account_id, profile))
         if profile.rss_feeds:
-            items.extend(self._rss_items(profile.rss_feeds[:4]))
+            items.extend(self._rss_items(x_account_id, profile.rss_feeds[:4]))
         if not items:
-            items.extend(self._demo_signals(profile))
+            items.extend(self._demo_signals(x_account_id, profile))
         # De-duplicate by title while preserving order and cap prompt size.
         seen: set[str] = set()
         unique: list[TrendItem] = []
@@ -47,7 +47,9 @@ class TrendCollector:
         return unique[:8]
 
 
-    def _x_recent_items(self, profile: StartupProfile) -> list[TrendItem]:
+    def _x_recent_items(
+        self, x_account_id: int, profile: StartupProfile
+    ) -> list[TrendItem]:
         """Optional X recent-search adapter.
 
         The returned snippets are research signals only. The prompt and
@@ -78,6 +80,7 @@ class TrendCollector:
                 score = 0.7 + min(float(metrics.get("like_count", 0)) / 1000.0, 0.25)
                 items.append(
                     TrendItem(
+                        x_account_id=x_account_id,
                         title="Recent X discussion in the configured domain",
                         summary=compact[:320],
                         source="x-recent-search",
@@ -91,13 +94,16 @@ class TrendCollector:
             logger.warning("X recent-search collection failed: %s", exc)
             return []
 
-    def _demo_signals(self, profile: StartupProfile) -> list[TrendItem]:
+    def _demo_signals(
+        self, x_account_id: int, profile: StartupProfile
+    ) -> list[TrendItem]:
         keywords = profile.trend_keywords or profile.content_pillars or [profile.domain]
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         signals = []
         for index, keyword in enumerate(keywords[:3]):
             signals.append(
                 TrendItem(
+                    x_account_id=x_account_id,
                     title=f"Current discussion around {keyword}",
                     summary=(
                         f"Teams in {profile.domain} are comparing practical trade-offs around "
@@ -113,6 +119,7 @@ class TrendCollector:
         if profile.competitor_accounts:
             signals.append(
                 TrendItem(
+                    x_account_id=x_account_id,
                     title="Competitor conversation watch",
                     summary=(
                         "Configured competitor accounts are treated only as market signals; "
@@ -125,7 +132,7 @@ class TrendCollector:
             )
         return signals
 
-    def _rss_items(self, urls: Iterable[str]) -> list[TrendItem]:
+    def _rss_items(self, x_account_id: int, urls: Iterable[str]) -> list[TrendItem]:
         collected: list[TrendItem] = []
         with httpx.Client(timeout=self.settings.rss_timeout_seconds, follow_redirects=True) as client:
             for url in urls:
@@ -154,6 +161,7 @@ class TrendCollector:
                         if title:
                             collected.append(
                                 TrendItem(
+                                    x_account_id=x_account_id,
                                     title=_strip_html(title)[:180],
                                     summary=_strip_html(summary)[:500],
                                     source="rss",

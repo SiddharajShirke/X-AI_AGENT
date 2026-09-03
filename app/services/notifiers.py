@@ -6,25 +6,26 @@ from typing import Protocol
 import httpx
 
 from app.config import Settings
-from app.models import ContentContext, Draft, NotificationResult, StartupProfile
+from app.models import ContentContext, Draft, NotificationResult, StartupProfile, XAccount
 
 logger = logging.getLogger(__name__)
 
 
 class Notifier(Protocol):
     def notify_for_review(
-        self, draft: Draft, profile: StartupProfile, context: ContentContext
+        self, draft: Draft, account: XAccount, profile: StartupProfile, context: ContentContext
     ) -> NotificationResult: ...
 
-    def notify_status(self, draft: Draft, message: str) -> NotificationResult: ...
+    def notify_status(self, draft: Draft, account: XAccount, message: str) -> NotificationResult: ...
 
 
 class ConsoleNotifier:
     def notify_for_review(
-        self, draft: Draft, profile: StartupProfile, context: ContentContext
+        self, draft: Draft, account: XAccount, profile: StartupProfile, context: ContentContext
     ) -> NotificationResult:
         logger.info(
-            "Draft ready for review: startup=%s context=%s draft=%s text=%s",
+            "Draft ready for review: account=%s startup=%s context=%s draft=%s text=%s",
+            account.handle,
             profile.name,
             context.name,
             draft.id,
@@ -32,8 +33,11 @@ class ConsoleNotifier:
         )
         return NotificationResult(success=True, provider="console")
 
-    def notify_status(self, draft: Draft, message: str) -> NotificationResult:
-        logger.info("Draft status: draft=%s status=%s message=%s", draft.id, draft.status, message)
+    def notify_status(self, draft: Draft, account: XAccount, message: str) -> NotificationResult:
+        logger.info(
+            "Draft status: account=%s draft=%s status=%s message=%s",
+            account.handle, draft.id, draft.status, message,
+        )
         return NotificationResult(success=True, provider="console")
 
 
@@ -51,11 +55,11 @@ class TelegramNotifier:
         self.client = client or httpx.Client(timeout=10.0)
 
     def notify_for_review(
-        self, draft: Draft, profile: StartupProfile, context: ContentContext
+        self, draft: Draft, account: XAccount, profile: StartupProfile, context: ContentContext
     ) -> NotificationResult:
         text = (
             f"X POST READY FOR REVIEW\n\n"
-            f"Startup: {profile.name}\n"
+            f"Account: {profile.name} (@{account.handle})\n"
             f"Context: {context.name}\n"
             f"Attempt: {draft.attempt}\n"
             f"Topic: {draft.topic}\n\n"
@@ -69,13 +73,19 @@ class TelegramNotifier:
             "reply_markup": {
                 "inline_keyboard": [
                     [
-                        {"text": "✅ Approve", "callback_data": f"approve:{draft.id}"},
-                        {"text": "❌ Reject + regenerate", "callback_data": f"reject:{draft.id}"},
+                        {
+                            "text": "✅ Approve",
+                            "callback_data": f"approve:{account.id}:{draft.id}",
+                        },
+                        {
+                            "text": "❌ Reject + regenerate",
+                            "callback_data": f"reject:{account.id}:{draft.id}",
+                        },
                     ],
                     [
                         {
                             "text": "✏️ Open review dashboard",
-                            "url": f"{self.base_url}/#draft-{draft.id}",
+                            "url": f"{self.base_url}/accounts/{account.id}#draft-{draft.id}",
                         }
                     ],
                 ]
@@ -97,11 +107,14 @@ class TelegramNotifier:
         except Exception as exc:
             return NotificationResult(success=False, provider="telegram", error=str(exc))
 
-    def notify_status(self, draft: Draft, message: str) -> NotificationResult:
+    def notify_status(self, draft: Draft, account: XAccount, message: str) -> NotificationResult:
         try:
             response = self.client.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": self.chat_id, "text": f"{message}\nDraft: {draft.id}"},
+                json={
+                    "chat_id": self.chat_id,
+                    "text": f"@{account.handle}: {message}\nDraft: {draft.id}",
+                },
             )
             response.raise_for_status()
             return NotificationResult(success=True, provider="telegram")
@@ -116,9 +129,9 @@ class SlackNotifier:
         self.client = client or httpx.Client(timeout=10.0)
 
     def notify_for_review(
-        self, draft: Draft, profile: StartupProfile, context: ContentContext
+        self, draft: Draft, account: XAccount, profile: StartupProfile, context: ContentContext
     ) -> NotificationResult:
-        review_url = f"{self.base_url}/#draft-{draft.id}"
+        review_url = f"{self.base_url}/accounts/{account.id}#draft-{draft.id}"
         payload = {
             "text": f"X post ready for review: {review_url}",
             "blocks": [
@@ -131,7 +144,8 @@ class SlackNotifier:
                     "text": {
                         "type": "mrkdwn",
                         "text": (
-                            f"*Startup:* {profile.name}\n*Context:* {context.name}\n"
+                            f"*Account:* {profile.name} (@{account.handle})\n"
+                            f"*Context:* {context.name}\n"
                             f"*Attempt:* {draft.attempt}\n\n{draft.text}"
                         ),
                     },
@@ -155,11 +169,11 @@ class SlackNotifier:
         except Exception as exc:
             return NotificationResult(success=False, provider="slack", error=str(exc))
 
-    def notify_status(self, draft: Draft, message: str) -> NotificationResult:
+    def notify_status(self, draft: Draft, account: XAccount, message: str) -> NotificationResult:
         try:
             response = self.client.post(
                 self.webhook_url,
-                json={"text": f"{message} — draft {draft.id}"},
+                json={"text": f"@{account.handle}: {message} — draft {draft.id}"},
             )
             response.raise_for_status()
             return NotificationResult(success=True, provider="slack")
@@ -187,12 +201,12 @@ class NotifierManager:
         return cls(notifiers)
 
     def notify_for_review(
-        self, draft: Draft, profile: StartupProfile, context: ContentContext
+        self, draft: Draft, account: XAccount, profile: StartupProfile, context: ContentContext
     ) -> list[NotificationResult]:
         results = []
         for notifier in self.notifiers:
             try:
-                results.append(notifier.notify_for_review(draft, profile, context))
+                results.append(notifier.notify_for_review(draft, account, profile, context))
             except Exception as exc:
                 results.append(
                     NotificationResult(
@@ -203,11 +217,11 @@ class NotifierManager:
                 )
         return results
 
-    def notify_status(self, draft: Draft, message: str) -> list[NotificationResult]:
+    def notify_status(self, draft: Draft, account: XAccount, message: str) -> list[NotificationResult]:
         results = []
         for notifier in self.notifiers:
             try:
-                results.append(notifier.notify_status(draft, message))
+                results.append(notifier.notify_status(draft, account, message))
             except Exception as exc:
                 results.append(
                     NotificationResult(

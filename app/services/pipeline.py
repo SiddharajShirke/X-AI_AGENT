@@ -44,33 +44,43 @@ class Pipeline:
 
     def generate_draft(
         self,
+        x_account_id: int,
         *,
         context_id: int | None = None,
         schedule_id: int | None = None,
         parent_draft_id: str | None = None,
         attempt: int = 1,
     ) -> Draft:
-        profile = self.repository.get_profile()
-        schedule = self.repository.get_schedule(schedule_id) if schedule_id else None
+        account = self.repository.get_account(x_account_id)
+        if not account.enabled:
+            raise PipelineError(f"X account @{account.handle} is paused")
+        profile = self.repository.get_profile(x_account_id)
+        schedule = (
+            self.repository.get_schedule(x_account_id, schedule_id) if schedule_id else None
+        )
         resolved_context_id = context_id or (schedule.context_id if schedule else None)
         if resolved_context_id is None:
-            enabled = self.repository.list_contexts(enabled_only=True)
+            enabled = self.repository.list_contexts(x_account_id, enabled_only=True)
             if not enabled:
                 raise PipelineError("No enabled content context is available")
             resolved_context_id = enabled[0].id
-        context = self.repository.get_context(resolved_context_id)
+        context = self.repository.get_context(x_account_id, resolved_context_id)
         if not context.enabled:
             raise PipelineError(f"Content context {context.id} is disabled")
 
-        trends = self.trend_collector.collect(profile) if context.live_trends_required else []
-        approved, rejected, preferences = self.feedback_engine.memory_bundle()
+        trends = (
+            self.trend_collector.collect(x_account_id, profile)
+            if context.live_trends_required
+            else []
+        )
+        approved, rejected, preferences = self.feedback_engine.memory_bundle(x_account_id)
         parent_text = ""
         if parent_draft_id:
-            parent_text = self.repository.get_draft(parent_draft_id).text
+            parent_text = self.repository.get_draft(x_account_id, parent_draft_id).text
             if parent_text not in rejected:
                 rejected = [parent_text, *rejected]
 
-        history = self.repository.recent_draft_texts(limit=100)
+        history = self.repository.recent_draft_texts(x_account_id, limit=100)
         chosen = None
         chosen_safety = None
         chosen_similarity = None
@@ -109,6 +119,7 @@ class Pipeline:
             ).isoformat(timespec="seconds")
 
         draft = self.repository.create_draft(
+            x_account_id,
             context_id=context.id,
             schedule_id=schedule.id if schedule else None,
             text=chosen.text,
@@ -119,12 +130,13 @@ class Pipeline:
             similarity_score=chosen_similarity.score,
             attempt=attempt,
             parent_draft_id=parent_draft_id,
-            config_version=self.repository.current_config_version(),
+            config_version=self.repository.current_config_version(x_account_id),
             expires_at=expires_at,
             generator_provider=chosen.provider,
             prompt_snapshot=chosen.prompt_snapshot,
         )
         self.repository.log_event(
+            x_account_id,
             "draft_generated",
             draft.id,
             {
@@ -136,33 +148,51 @@ class Pipeline:
             },
         )
         if status == "pending":
-            results = self.notifiers.notify_for_review(draft, profile, context)
+            results = self.notifiers.notify_for_review(draft, account, profile, context)
             self.repository.log_event(
+                x_account_id,
                 "review_notification_sent",
                 draft.id,
                 {"results": [result.model_dump() for result in results]},
             )
         return draft
 
-    def approve(self, draft_id: str, *, reviewer: str = "human") -> Draft:
-        draft = self.repository.get_draft(draft_id)
+    def approve(
+        self,
+        x_account_id: int,
+        draft_id: str,
+        *,
+        reviewer: str,
+        origin: str = "dashboard",
+    ) -> Draft:
+        account = self.repository.get_account(x_account_id)
+        if not account.enabled:
+            raise PipelineError(f"X account @{account.handle} is paused")
+        draft = self.repository.get_draft(x_account_id, draft_id)
         if draft.status != "pending":
             raise PipelineError(f"Only pending drafts can be approved; status is {draft.status}")
-        profile = self.repository.get_profile()
+        profile = self.repository.get_profile(x_account_id)
         safety = self.safety_guard.check(draft.text, profile)
         if not safety.safe:
             blocked = self.repository.update_draft(
+                x_account_id,
                 draft.id,
                 status="blocked",
                 safety_status="blocked",
                 error="; ".join(safety.reasons),
                 reviewer=reviewer,
             )
-            self.repository.log_event("approval_blocked_by_safety", draft.id, {"reasons": safety.reasons})
+            self.repository.log_event(
+                x_account_id,
+                "approval_blocked_by_safety",
+                draft.id,
+                {"reasons": safety.reasons, "origin": origin, "reviewer": reviewer},
+            )
             return blocked
 
         approved_at = utc_now_iso()
         draft = self.repository.update_draft(
+            x_account_id,
             draft.id,
             status="approved",
             approved_at=approved_at,
@@ -172,6 +202,7 @@ class Pipeline:
         result = self.publishers.publish(draft)
         if result.success:
             draft = self.repository.update_draft(
+                x_account_id,
                 draft.id,
                 status="published",
                 published_at=utc_now_iso(),
@@ -182,33 +213,76 @@ class Pipeline:
             )
             self.feedback_engine.record_approval(draft, reviewer)
             self.repository.log_event(
+                x_account_id,
                 "draft_published",
                 draft.id,
-                {"provider": result.provider, "post_url": result.post_url},
+                {
+                    "provider": result.provider,
+                    "post_url": result.post_url,
+                    "origin": origin,
+                    "reviewer": reviewer,
+                },
             )
-            self.notifiers.notify_status(draft, "Approved and published")
+            self.notifiers.notify_status(draft, account, "Approved and published")
         else:
             draft = self.repository.update_draft(
+                x_account_id,
                 draft.id,
                 status="failed",
                 publisher_provider=result.provider,
                 error=result.error,
             )
             self.repository.log_event(
-                "publish_failed", draft.id, {"provider": result.provider, "error": result.error}
+                x_account_id,
+                "publish_failed",
+                draft.id,
+                {
+                    "provider": result.provider,
+                    "error": result.error,
+                    "origin": origin,
+                    "reviewer": reviewer,
+                },
             )
-            self.notifiers.notify_status(draft, "Approval succeeded, but publishing failed")
+            self.notifiers.notify_status(
+                draft, account, "Approval succeeded, but publishing failed"
+            )
         return draft
+
+    def retry_publish(
+        self,
+        x_account_id: int,
+        draft_id: str,
+        *,
+        reviewer: str,
+        origin: str = "dashboard",
+    ) -> Draft:
+        account = self.repository.get_account(x_account_id)
+        if not account.enabled:
+            raise PipelineError(f"X account @{account.handle} is paused")
+        draft = self.repository.get_draft(x_account_id, draft_id)
+        if draft.status != "failed":
+            raise PipelineError(
+                f"Only failed drafts can retry publishing; status is {draft.status}"
+            )
+        self.repository.update_draft(x_account_id, draft.id, status="pending")
+        return self.approve(
+            x_account_id, draft.id, reviewer=reviewer, origin=origin
+        )
 
     def reject_and_regenerate(
         self,
+        x_account_id: int,
         draft_id: str,
         *,
         reason: str,
         notes: str = "",
-        reviewer: str = "human",
+        reviewer: str,
+        origin: str = "dashboard",
     ) -> Draft | None:
-        draft = self.repository.get_draft(draft_id)
+        account = self.repository.get_account(x_account_id)
+        if not account.enabled:
+            raise PipelineError(f"X account @{account.handle} is paused")
+        draft = self.repository.get_draft(x_account_id, draft_id)
         if draft.status != "pending":
             raise PipelineError(f"Only pending drafts can be rejected; status is {draft.status}")
         self.feedback_engine.record_rejection(
@@ -217,9 +291,10 @@ class Pipeline:
             notes=notes,
             reviewer=reviewer,
         )
-        profile = self.repository.get_profile()
+        profile = self.repository.get_profile(x_account_id)
         if draft.attempt >= profile.max_attempts:
             self.repository.update_draft(
+                x_account_id,
                 draft.id,
                 status="needs_guidance",
                 rejection_reason=reason,
@@ -228,13 +303,19 @@ class Pipeline:
                 expires_at=None,
             )
             self.repository.log_event(
+                x_account_id,
                 "regeneration_limit_reached",
                 draft.id,
-                {"attempt": draft.attempt, "max_attempts": profile.max_attempts},
+                {
+                    "attempt": draft.attempt,
+                    "max_attempts": profile.max_attempts,
+                    "origin": origin,
+                },
             )
             return None
 
         self.repository.update_draft(
+            x_account_id,
             draft.id,
             status="rejected",
             rejection_reason=reason,
@@ -243,11 +324,18 @@ class Pipeline:
             expires_at=None,
         )
         self.repository.log_event(
+            x_account_id,
             "draft_rejected",
             draft.id,
-            {"reason": reason, "notes": notes, "next_attempt": draft.attempt + 1},
+            {
+                "reason": reason,
+                "notes": notes,
+                "next_attempt": draft.attempt + 1,
+                "origin": origin,
+            },
         )
         replacement = self.generate_draft(
+            x_account_id,
             context_id=draft.context_id,
             schedule_id=draft.schedule_id,
             parent_draft_id=draft.id,
@@ -257,24 +345,31 @@ class Pipeline:
 
     def edit(
         self,
+        x_account_id: int,
         draft_id: str,
         new_text: str,
         *,
-        reviewer: str = "human",
+        reviewer: str,
         notes: str = "",
         approve: bool = False,
     ) -> Draft:
-        draft = self.repository.get_draft(draft_id)
+        account = self.repository.get_account(x_account_id)
+        if not account.enabled:
+            raise PipelineError(f"X account @{account.handle} is paused")
+        draft = self.repository.get_draft(x_account_id, draft_id)
         if draft.status != "pending":
             raise PipelineError(f"Only pending drafts can be edited; status is {draft.status}")
-        profile = self.repository.get_profile()
+        profile = self.repository.get_profile(x_account_id)
         safety = self.safety_guard.check(new_text, profile)
         similarity = self.similarity_guard.check(
             new_text,
-            self.repository.recent_draft_texts(limit=100, exclude_id=draft.id),
+            self.repository.recent_draft_texts(
+                x_account_id, limit=100, exclude_id=draft.id
+            ),
         )
         if not safety.safe or not similarity.unique:
             blocked = self.repository.create_draft(
+                x_account_id,
                 context_id=draft.context_id,
                 schedule_id=draft.schedule_id,
                 text=new_text,
@@ -285,12 +380,13 @@ class Pipeline:
                 similarity_score=similarity.score,
                 attempt=draft.attempt + 1,
                 parent_draft_id=draft.id,
-                config_version=self.repository.current_config_version(),
+                config_version=self.repository.current_config_version(x_account_id),
                 expires_at=None,
                 generator_provider="human_edit",
                 prompt_snapshot="",
             )
             self.repository.update_draft(
+                x_account_id,
                 blocked.id,
                 reviewer=reviewer,
                 reviewer_notes=notes,
@@ -298,11 +394,16 @@ class Pipeline:
                 or f"Too similar to a previous post ({similarity.score:.2f})",
             )
             self.repository.log_event(
+                x_account_id,
                 "human_edit_blocked",
                 blocked.id,
-                {"safety": safety.reasons, "similarity": similarity.score},
+                {
+                    "safety": safety.reasons,
+                    "similarity": similarity.score,
+                    "origin": "dashboard",
+                },
             )
-            return self.repository.get_draft(blocked.id)
+            return self.repository.get_draft(x_account_id, blocked.id)
 
         self.feedback_engine.record_edit(
             draft,
@@ -311,6 +412,7 @@ class Pipeline:
             notes=notes,
         )
         self.repository.update_draft(
+            x_account_id,
             draft.id,
             status="rejected",
             rejection_reason="edited",
@@ -323,6 +425,7 @@ class Pipeline:
             + timedelta(minutes=profile.approval_timeout_minutes)
         ).isoformat(timespec="seconds")
         edited = self.repository.create_draft(
+            x_account_id,
             context_id=draft.context_id,
             schedule_id=draft.schedule_id,
             text=new_text.strip(),
@@ -333,49 +436,76 @@ class Pipeline:
             similarity_score=similarity.score,
             attempt=draft.attempt + 1,
             parent_draft_id=draft.id,
-            config_version=self.repository.current_config_version(),
+            config_version=self.repository.current_config_version(x_account_id),
             expires_at=expires_at,
             generator_provider="human_edit",
             prompt_snapshot="",
         )
-        self.repository.log_event("draft_edited", edited.id, {"parent": draft.id})
-        return self.approve(edited.id, reviewer=reviewer) if approve else edited
+        self.repository.log_event(
+            x_account_id,
+            "draft_edited",
+            edited.id,
+            {"parent": draft.id, "origin": "dashboard"},
+        )
+        return (
+            self.approve(
+                x_account_id, edited.id, reviewer=reviewer, origin="dashboard"
+            )
+            if approve
+            else edited
+        )
 
-    def expire_and_regenerate(self, now: datetime | None = None) -> list[Draft]:
+    def expire_and_regenerate(
+        self,
+        now: datetime | None = None,
+        x_account_id: int | None = None,
+    ) -> list[Draft]:
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
         replacements: list[Draft] = []
-        for draft in self.repository.pending_expired_before(now.astimezone(timezone.utc).isoformat(timespec="seconds")):
-            self.feedback_engine.record_rejection(
-                draft,
-                reason="timeout",
-                notes="No explicit human approval was received before the deadline.",
-                reviewer="system",
-                decision="expired",
-            )
-            profile = self.repository.get_profile()
-            if draft.attempt >= profile.max_attempts:
+        if x_account_id is None:
+            accounts = self.repository.list_accounts(enabled_only=True)
+        else:
+            account = self.repository.get_account(x_account_id)
+            if not account.enabled:
+                return replacements
+            accounts = [account]
+        cutoff = now.astimezone(timezone.utc).isoformat(timespec="seconds")
+        for account in accounts:
+            profile = self.repository.get_profile(account.id)
+            for draft in self.repository.pending_expired_before(account.id, cutoff):
+                self.feedback_engine.record_rejection(
+                    draft,
+                    reason="timeout",
+                    notes="No explicit human approval was received before the deadline.",
+                    reviewer="system",
+                    decision="expired",
+                )
+                if draft.attempt >= profile.max_attempts:
+                    self.repository.update_draft(
+                        account.id,
+                        draft.id,
+                        status="needs_guidance",
+                        rejection_reason="timeout",
+                        reviewer_notes="Approval timeout and attempt limit reached.",
+                        expires_at=None,
+                    )
+                    continue
                 self.repository.update_draft(
+                    account.id,
                     draft.id,
-                    status="needs_guidance",
+                    status="expired",
                     rejection_reason="timeout",
-                    reviewer_notes="Approval timeout and attempt limit reached.",
+                    reviewer_notes="No explicit approval received.",
                     expires_at=None,
                 )
-                continue
-            self.repository.update_draft(
-                draft.id,
-                status="expired",
-                rejection_reason="timeout",
-                reviewer_notes="No explicit approval received.",
-                expires_at=None,
-            )
-            replacement = self.generate_draft(
-                context_id=draft.context_id,
-                schedule_id=draft.schedule_id,
-                parent_draft_id=draft.id,
-                attempt=draft.attempt + 1,
-            )
-            replacements.append(replacement)
+                replacement = self.generate_draft(
+                    account.id,
+                    context_id=draft.context_id,
+                    schedule_id=draft.schedule_id,
+                    parent_draft_id=draft.id,
+                    attempt=draft.attempt + 1,
+                )
+                replacements.append(replacement)
         return replacements

@@ -6,8 +6,9 @@ from app.services.safety import SafetyGuard
 from app.services.similarity import SimilarityGuard
 
 
-def test_safety_guard_blocks_confidential_disclosure(repository):
+def test_safety_guard_blocks_confidential_disclosure(repository, x_account):
     profile = repository.update_profile(
+        x_account.id,
         {"never_reveal": ["Project Atlas scoring algorithm", "customer names"]}
     )
     result = SafetyGuard().check(
@@ -29,9 +30,10 @@ def test_similarity_guard_rejects_near_duplicate():
     assert result.score >= 0.75
 
 
-def test_rejection_creates_durable_learning(repository):
-    context = repository.list_contexts()[0]
+def test_rejection_creates_durable_learning(repository, x_account):
+    context = repository.list_contexts(x_account.id)[0]
     draft = repository.create_draft(
+        x_account.id,
         context_id=context.id,
         schedule_id=None,
         text="AI is revolutionary and changes everything.",
@@ -42,7 +44,7 @@ def test_rejection_creates_durable_learning(repository):
         similarity_score=0.0,
         attempt=1,
         parent_draft_id=None,
-        config_version=repository.current_config_version(),
+        config_version=repository.current_config_version(x_account.id),
         expires_at=None,
         generator_provider="demo",
     )
@@ -53,13 +55,17 @@ def test_rejection_creates_durable_learning(repository):
     )
 
     assert "natural" in feedback.learned_rule.lower()
-    assert any("revolutionary" in item.rule.lower() for item in repository.list_preferences())
+    assert any(
+        "revolutionary" in item.rule.lower()
+        for item in repository.list_preferences(x_account.id)
+    )
 
 
-def test_prompt_contains_positive_and_negative_examples(repository):
-    profile = repository.get_profile()
-    context = repository.list_contexts()[0]
+def test_prompt_contains_positive_and_negative_examples(repository, x_account):
+    profile = repository.get_profile(x_account.id)
+    context = repository.list_contexts(x_account.id)[0]
     approved = repository.create_draft(
+        x_account.id,
         context_id=context.id,
         schedule_id=None,
         text="The hard part starts after a workflow succeeds once.",
@@ -70,11 +76,12 @@ def test_prompt_contains_positive_and_negative_examples(repository):
         similarity_score=0.0,
         attempt=1,
         parent_draft_id=None,
-        config_version=repository.current_config_version(),
+        config_version=repository.current_config_version(x_account.id),
         expires_at=None,
         generator_provider="demo",
     )
     rejected = repository.create_draft(
+        x_account.id,
         context_id=context.id,
         schedule_id=None,
         text="The future is here and AI changes everything.",
@@ -85,11 +92,12 @@ def test_prompt_contains_positive_and_negative_examples(repository):
         similarity_score=0.0,
         attempt=1,
         parent_draft_id=None,
-        config_version=repository.current_config_version(),
+        config_version=repository.current_config_version(x_account.id),
         expires_at=None,
         generator_provider="demo",
     )
     repository.create_feedback(
+        x_account.id,
         draft_id=rejected.id,
         decision="rejected",
         reason="too_generic",

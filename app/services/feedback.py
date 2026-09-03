@@ -49,6 +49,7 @@ class FeedbackEngine:
         note_rule = _note_rule(notes)
         learned_rule = f"{base_rule} {note_rule}".strip()
         feedback = self.repository.create_feedback(
+            draft.x_account_id,
             draft_id=draft.id,
             decision=decision,
             reason=reason,
@@ -57,12 +58,14 @@ class FeedbackEngine:
             reviewer=reviewer,
         )
         self.repository.upsert_preference(
+            draft.x_account_id,
             rule=base_rule,
             source_feedback_id=feedback.id,
             delta=1.0,
         )
         if note_rule:
             self.repository.upsert_preference(
+                draft.x_account_id,
                 rule=note_rule,
                 source_feedback_id=feedback.id,
                 delta=1.0,
@@ -72,6 +75,7 @@ class FeedbackEngine:
     def record_approval(self, draft: Draft, reviewer: str) -> FeedbackRecord:
         rule = _REASON_RULES["approved"]
         feedback = self.repository.create_feedback(
+            draft.x_account_id,
             draft_id=draft.id,
             decision="approved",
             reason="approved",
@@ -80,6 +84,7 @@ class FeedbackEngine:
             reviewer=reviewer,
         )
         self.repository.upsert_preference(
+            draft.x_account_id,
             rule=rule,
             source_feedback_id=feedback.id,
             delta=0.25,
@@ -105,10 +110,14 @@ class FeedbackEngine:
             decision="edited",
         )
 
-    def memory_bundle(self) -> tuple[list[str], list[str], list[str]]:
-        approved = self.repository.example_texts(["published", "approved"], limit=5)
-        rejected = self.repository.example_texts(
-            ["rejected", "expired", "needs_guidance"], limit=7
+    def memory_bundle(self, x_account_id: int) -> tuple[list[str], list[str], list[str]]:
+        approved = self.repository.example_texts(
+            x_account_id, ["published", "approved"], limit=5
         )
-        preferences = [item.rule for item in self.repository.list_preferences(limit=12)]
+        rejected = self.repository.example_texts(
+            x_account_id, ["rejected", "expired", "needs_guidance"], limit=7
+        )
+        preferences = [
+            item.rule for item in self.repository.list_preferences(x_account_id, limit=12)
+        ]
         return approved, rejected, preferences

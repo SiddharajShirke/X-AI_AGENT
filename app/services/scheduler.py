@@ -23,41 +23,56 @@ class SchedulerService:
         self._stop_event = asyncio.Event()
 
     def tick(self, now: datetime | None = None) -> SchedulerTickResult:
-        profile = self.repository.get_profile()
-        try:
-            zone = ZoneInfo(profile.timezone)
-        except ZoneInfoNotFoundError:
-            zone = ZoneInfo("UTC")
         current = now or datetime.now(timezone.utc)
         if current.tzinfo is None:
-            current = current.replace(tzinfo=zone)
-        local_now = current.astimezone(zone)
-        local_date = local_now.date().isoformat()
-        local_time = local_now.strftime("%H:%M")
+            current = current.replace(tzinfo=timezone.utc)
 
         result = SchedulerTickResult()
-        for schedule in self.repository.list_schedules():
-            if not schedule.enabled:
-                continue
-            if schedule.time_local != local_time:
-                continue
-            if schedule.last_run_date == local_date:
-                continue
+        for account in self.repository.list_accounts(enabled_only=True):
             try:
-                draft = self.pipeline.generate_draft(schedule_id=schedule.id)
-                self.repository.mark_schedule_run(schedule.id, local_date)
-                result.generated.append(draft)
-            except Exception as exc:
-                logger.exception("Scheduled draft generation failed for slot %s", schedule.id)
-                result.errors.append(f"Slot {schedule.slot_number}: {exc}")
+                zone = ZoneInfo(account.timezone)
+            except ZoneInfoNotFoundError:
+                zone = ZoneInfo("UTC")
+            local_now = current.astimezone(zone)
+            local_date = local_now.date().isoformat()
+            local_time = local_now.strftime("%H:%M")
 
-        try:
-            result.expired_replacements.extend(
-                self.pipeline.expire_and_regenerate(current.astimezone(timezone.utc))
-            )
-        except Exception as exc:
-            logger.exception("Approval-timeout processing failed")
-            result.errors.append(f"Timeout processing: {exc}")
+            for schedule in self.repository.list_schedules(account.id):
+                if not schedule.enabled:
+                    continue
+                if schedule.time_local != local_time:
+                    continue
+                if schedule.last_run_date == local_date:
+                    continue
+                try:
+                    draft = self.pipeline.generate_draft(
+                        account.id, schedule_id=schedule.id
+                    )
+                    self.repository.mark_schedule_run(
+                        account.id, schedule.id, local_date
+                    )
+                    result.generated.append(draft)
+                except Exception as exc:
+                    logger.exception(
+                        "Scheduled draft generation failed for account %s slot %s",
+                        account.id,
+                        schedule.id,
+                    )
+                    result.errors.append(
+                        f"@{account.handle} slot {schedule.slot_number}: {exc}"
+                    )
+
+            try:
+                result.expired_replacements.extend(
+                    self.pipeline.expire_and_regenerate(
+                        current.astimezone(timezone.utc), x_account_id=account.id
+                    )
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Approval-timeout processing failed for account %s", account.id
+                )
+                result.errors.append(f"@{account.handle} timeout processing: {exc}")
         return result
 
     async def run_forever(self) -> None:
