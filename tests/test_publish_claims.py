@@ -146,6 +146,25 @@ def test_global_off_and_account_off_are_intentional_dry_runs(
     assert second.publisher_provider == "dry_run"
 
 
+def test_approval_rejects_a_stale_expected_publication_mode(
+    settings, repository, x_account
+):
+    repository.update_account(x_account.id, {"live_posting_enabled": False})
+    pipeline, _ = _live_pipeline(settings, repository)
+    draft = _pending(pipeline, repository, x_account.id)
+    repository.update_account(x_account.id, {"live_posting_enabled": True})
+
+    with pytest.raises(PipelineError, match="Publication mode changed"):
+        pipeline.approve(
+            x_account.id,
+            draft.id,
+            reviewer="admin",
+            expected_live_posting=False,
+        )
+
+    assert repository.get_draft(x_account.id, draft.id).status == "pending"
+
+
 def test_live_account_with_missing_connection_fails_visibly(
     settings, repository, x_account
 ):

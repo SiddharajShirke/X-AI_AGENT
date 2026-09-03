@@ -66,11 +66,18 @@ async def slack_action(connection_id: int, request: Request):
     pipeline = request.app.state.services.pipeline
     try:
         if action_id == "approve_draft":
+            expected_live = value.get("expected_live")
+            if not isinstance(expected_live, bool):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Approval mode is missing; request a fresh Slack review",
+                )
             result = pipeline.approve(
                 x_account_id,
                 draft_id,
                 reviewer=reviewer,
                 origin="slack",
+                expected_live_posting=expected_live,
             )
         elif action_id == "reject_draft":
             result = pipeline.reject_and_regenerate(

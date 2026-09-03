@@ -156,7 +156,11 @@ class SlackNotifier:
             else "Approve in dry-run"
         )
         action_value = json.dumps(
-            {"x_account_id": account.id, "draft_id": draft.id},
+            {
+                "x_account_id": account.id,
+                "draft_id": draft.id,
+                "expected_live": self.live_posting,
+            },
             separators=(",", ":"),
         )
         payload = {

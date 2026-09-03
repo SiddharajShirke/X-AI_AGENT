@@ -21,14 +21,24 @@ def _configured_settings(settings):
     )
 
 
-def _slack_payload(action_id: str, account_id: int, draft_id: str) -> dict:
+def _slack_payload(
+    action_id: str,
+    account_id: int,
+    draft_id: str,
+    *,
+    expected_live: bool = False,
+) -> dict:
     return {
         "user": {"id": "U123", "name": "reviewer"},
         "actions": [
             {
                 "action_id": action_id,
                 "value": json.dumps(
-                    {"x_account_id": account_id, "draft_id": draft_id}
+                    {
+                        "x_account_id": account_id,
+                        "draft_id": draft_id,
+                        "expected_live": expected_live,
+                    }
                 ),
             }
         ],
@@ -122,6 +132,7 @@ def test_slack_review_message_contains_account_actions_and_edit_link(repository)
         "reject_draft",
     }
     assert f"publish to @{account.handle}" in actions[0]["text"]["text"]
+    assert json.loads(actions[0]["value"])["expected_live"] is True
     edit = next(item for item in actions if item.get("url"))
     assert edit["url"] == (
         f"https://review.example/accounts/{account.id}#draft-{draft.id}"
@@ -254,6 +265,41 @@ def test_valid_slack_approve_and_repeat_publish_once(settings):
                 "SELECT COUNT(*) FROM publish_attempts WHERE draft_id = ?", (draft.id,)
             ).fetchone()[0]
         assert attempts == 1
+
+
+def test_slack_dry_run_approval_is_rejected_after_account_switches_live(settings):
+    from app.main import create_app
+
+    configured = _configured_settings(settings).model_copy(
+        update={"buffer_live_posting": True}
+    )
+    app = create_app(settings=configured, start_scheduler=False)
+    with TestClient(app) as client:
+        account = app.state.repository.list_accounts()[0]
+        connection = _connect_slack(app, account.id)
+        draft = _pending(app, account.id)
+        app.state.repository.update_account(
+            account.id, {"live_posting_enabled": True}
+        )
+        body, headers = _signed_request(
+            _slack_payload(
+                "approve_draft",
+                account.id,
+                draft.id,
+                expected_live=False,
+            ),
+            "signing-secret",
+        )
+
+        response = client.post(
+            f"/integrations/slack/{connection.id}/actions",
+            content=body,
+            headers=headers,
+        )
+
+        assert response.status_code == 409
+        assert "Publication mode changed" in response.json()["detail"]
+        assert app.state.repository.get_draft(account.id, draft.id).status == "pending"
 
 
 def test_slack_rejection_regenerates_for_same_account(settings):

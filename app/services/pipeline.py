@@ -166,6 +166,7 @@ class Pipeline:
         *,
         reviewer: str,
         origin: str = "dashboard",
+        expected_live_posting: bool | None = None,
     ) -> Draft:
         account = self.repository.get_account(x_account_id)
         if not account.enabled:
@@ -175,6 +176,7 @@ class Pipeline:
             return draft
         if draft.status != "pending":
             raise PipelineError(f"Only pending drafts can be approved; status is {draft.status}")
+        self._require_expected_publication_mode(account, expected_live_posting)
         profile = self.repository.get_profile(x_account_id)
         safety = self.safety_guard.check(draft.text, profile)
         if not safety.safe:
@@ -272,6 +274,7 @@ class Pipeline:
         *,
         reviewer: str,
         origin: str = "dashboard",
+        expected_live_posting: bool | None = None,
     ) -> Draft:
         account = self.repository.get_account(x_account_id)
         if not account.enabled:
@@ -281,6 +284,7 @@ class Pipeline:
             raise PipelineError(
                 f"Only failed drafts can retry publishing; status is {draft.status}"
             )
+        self._require_expected_publication_mode(account, expected_live_posting)
         profile = self.repository.get_profile(x_account_id)
         safety = self.safety_guard.check(draft.text, profile)
         if not safety.safe:
@@ -407,6 +411,7 @@ class Pipeline:
         reviewer: str,
         notes: str = "",
         approve: bool = False,
+        expected_live_posting: bool | None = None,
     ) -> Draft:
         account = self.repository.get_account(x_account_id)
         if not account.enabled:
@@ -414,6 +419,8 @@ class Pipeline:
         draft = self.repository.get_draft(x_account_id, draft_id)
         if draft.status != "pending":
             raise PipelineError(f"Only pending drafts can be edited; status is {draft.status}")
+        if approve:
+            self._require_expected_publication_mode(account, expected_live_posting)
         profile = self.repository.get_profile(x_account_id)
         safety = self.safety_guard.check(new_text, profile)
         similarity = self.similarity_guard.check(
@@ -523,11 +530,28 @@ class Pipeline:
         )
         return (
             self.approve(
-                x_account_id, edited.id, reviewer=reviewer, origin="dashboard"
+                x_account_id,
+                edited.id,
+                reviewer=reviewer,
+                origin="dashboard",
+                expected_live_posting=expected_live_posting,
             )
             if approve
             else edited
         )
+
+    def _require_expected_publication_mode(
+        self, account, expected_live_posting: bool | None
+    ) -> None:
+        if expected_live_posting is None:
+            return
+        effective_live = bool(
+            self.settings.buffer_live_posting and account.live_posting_enabled
+        )
+        if expected_live_posting != effective_live:
+            raise PipelineError(
+                "Publication mode changed; refresh the review and confirm again"
+            )
 
     def expire_and_regenerate(
         self,

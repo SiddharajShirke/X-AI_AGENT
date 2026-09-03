@@ -402,11 +402,20 @@ def approve_ui(
     reviewer: str = Depends(require_admin),
     pipeline: Pipeline = Depends(get_pipeline),
     csrf_token: str = Form(""),
+    expected_live: bool | None = Form(default=None),
 ):
     _verify_csrf(request, csrf_token, reviewer)
+    if expected_live is None:
+        raise HTTPException(
+            status_code=400, detail="Approval mode is missing; refresh and confirm again"
+        )
     try:
         draft = pipeline.approve(
-            x_account_id, draft_id, reviewer=reviewer, origin="dashboard"
+            x_account_id,
+            draft_id,
+            reviewer=reviewer,
+            origin="dashboard",
+            expected_live_posting=expected_live,
         )
     except (PipelineError, KeyError) as exc:
         _form_error(exc)
@@ -421,11 +430,20 @@ def retry_ui(
     reviewer: str = Depends(require_admin),
     pipeline: Pipeline = Depends(get_pipeline),
     csrf_token: str = Form(""),
+    expected_live: bool | None = Form(default=None),
 ):
     _verify_csrf(request, csrf_token, reviewer)
+    if expected_live is None:
+        raise HTTPException(
+            status_code=400, detail="Approval mode is missing; refresh and confirm again"
+        )
     try:
         draft = pipeline.retry_publish(
-            x_account_id, draft_id, reviewer=reviewer, origin="dashboard"
+            x_account_id,
+            draft_id,
+            reviewer=reviewer,
+            origin="dashboard",
+            expected_live_posting=expected_live,
         )
     except (PipelineError, KeyError) as exc:
         _form_error(exc)
@@ -474,8 +492,13 @@ def edit_ui(
     text: str = Form(...),
     notes: str = Form(""),
     approve: str | None = Form(default=None),
+    expected_live: bool | None = Form(default=None),
 ):
     _verify_csrf(request, csrf_token, reviewer)
+    if approve and expected_live is None:
+        raise HTTPException(
+            status_code=400, detail="Approval mode is missing; refresh and confirm again"
+        )
     try:
         draft = pipeline.edit(
             x_account_id,
@@ -484,6 +507,7 @@ def edit_ui(
             reviewer=reviewer,
             notes=notes,
             approve=bool(approve),
+            expected_live_posting=expected_live,
         )
     except (PipelineError, KeyError) as exc:
         _form_error(exc)

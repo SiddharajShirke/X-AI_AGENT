@@ -44,7 +44,11 @@ def test_valid_csrf_approval_uses_authenticated_reviewer(settings):
         response = client.post(
             f"/ui/accounts/{account.id}/drafts/{draft.id}/approve",
             headers=_auth(),
-            data={"csrf_token": token, "reviewer": "forged-reviewer"},
+            data={
+                "csrf_token": token,
+                "expected_live": "false",
+                "reviewer": "forged-reviewer",
+            },
             follow_redirects=False,
         )
 
@@ -87,3 +91,31 @@ def test_ui_account_mismatch_cannot_mutate_draft(settings):
 
         assert response.status_code in {400, 404}
         assert repository.get_draft(first.id, draft.id).status == "pending"
+
+
+def test_dashboard_dry_run_approval_is_rejected_after_account_switches_live(settings):
+    from app.main import create_app
+
+    configured = settings.model_copy(update={"buffer_live_posting": True})
+    app = create_app(settings=configured, start_scheduler=False)
+    with TestClient(app) as client:
+        account, draft = _pending(app)
+        page = client.get(f"/accounts/{account.id}", headers=_auth())
+        assert 'name="expected_live" value="false"' in page.text
+
+        app.state.repository.update_account(
+            account.id, {"live_posting_enabled": True}
+        )
+        response = client.post(
+            f"/ui/accounts/{account.id}/drafts/{draft.id}/approve",
+            headers=_auth(),
+            data={
+                "csrf_token": app.state.csrf.issue("demo"),
+                "expected_live": "false",
+            },
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 400
+        assert "Publication mode changed" in response.text
+        assert app.state.repository.get_draft(account.id, draft.id).status == "pending"

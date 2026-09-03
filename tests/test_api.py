@@ -201,6 +201,27 @@ def test_account_workspace_names_publish_destination_and_has_csrf(settings):
         assert 'data-edit-form' in response.text
 
 
+def test_failed_retry_keeps_text_in_live_confirmation_scope(settings):
+    from app.main import create_app
+
+    configured = settings.model_copy(update={"buffer_live_posting": True})
+    with TestClient(create_app(settings=configured, start_scheduler=False)) as client:
+        repository = client.app.state.repository
+        account = repository.list_accounts()[0]
+        repository.update_account(account.id, {"live_posting_enabled": True})
+        draft = client.app.state.services.pipeline.generate_draft(
+            account.id, context_id=repository.list_contexts(account.id)[0].id
+        )
+        repository.update_draft(account.id, draft.id, status="failed", error="retry")
+
+        response = client.get(f"/accounts/{account.id}", headers=_auth())
+
+        assert response.status_code == 200
+        assert f'id="draft-{draft.id}"' in response.text
+        assert draft.text in response.text
+        assert 'name="expected_live" value="true"' in response.text
+
+
 def test_setup_page_has_seven_guided_steps_and_reusable_connections(settings):
     from app.main import create_app
 
