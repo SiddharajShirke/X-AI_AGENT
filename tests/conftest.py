@@ -27,13 +27,23 @@ def settings(tmp_path: Path):
 
 
 @pytest.fixture()
-def repository(settings):
+def database(settings):
     from app.db import Database
+
+    return Database(settings.database_path)
+
+
+@pytest.fixture()
+def repository(database):
     from app.repository import Repository
 
-    database = Database(settings.database_path)
     database.initialize()
     return Repository(database)
+
+
+@pytest.fixture()
+def x_account(repository):
+    return repository.list_accounts()[0]
 
 
 @pytest.fixture()
