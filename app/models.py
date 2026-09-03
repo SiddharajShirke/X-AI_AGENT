@@ -12,7 +12,7 @@ class Model(BaseModel):
 
 class StartupProfile(Model):
     id: int = 1
-    x_account_id: int = 1
+    x_account_id: int
     name: str
     domain: str
     target_audience: list[str] = Field(default_factory=list)
@@ -25,7 +25,6 @@ class StartupProfile(Model):
     trend_keywords: list[str] = Field(default_factory=list)
     competitor_accounts: list[str] = Field(default_factory=list)
     rss_feeds: list[str] = Field(default_factory=list)
-    timezone: str = "Asia/Kolkata"
     max_attempts: int = 3
     approval_timeout_minutes: int = 45
     updated_at: str
@@ -33,7 +32,7 @@ class StartupProfile(Model):
 
 class ContentContext(Model):
     id: int
-    x_account_id: int = 1
+    x_account_id: int
     name: str
     purpose: str
     tone: str
@@ -44,7 +43,7 @@ class ContentContext(Model):
 
 class ScheduleSlot(Model):
     id: int
-    x_account_id: int = 1
+    x_account_id: int
     context_id: int
     slot_number: int
     time_local: str
@@ -54,7 +53,7 @@ class ScheduleSlot(Model):
 
 class TrendItem(Model):
     id: int | None = None
-    x_account_id: int = 1
+    x_account_id: int
     title: str
     summary: str
     source: str
@@ -66,7 +65,7 @@ class TrendItem(Model):
 
 class Draft(Model):
     id: str
-    x_account_id: int = 1
+    x_account_id: int
     context_id: int
     schedule_id: int | None = None
     text: str
@@ -95,6 +94,7 @@ class Draft(Model):
 
 class FeedbackRecord(Model):
     id: int
+    x_account_id: int
     draft_id: str
     decision: str
     reason: str
@@ -106,7 +106,7 @@ class FeedbackRecord(Model):
 
 class LearnedPreference(Model):
     id: int
-    x_account_id: int = 1
+    x_account_id: int
     rule: str
     weight: float
     source_feedback_id: int | None = None

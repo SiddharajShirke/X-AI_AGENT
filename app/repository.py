@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import json
+import re
+import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Iterable
 
 from app.db import Database, utc_now_iso
 from app.models import (
+    AccountIntegration,
     ContentContext,
     Draft,
     FeedbackRecord,
+    IntegrationConnection,
     LearnedPreference,
     ScheduleSlot,
     StartupProfile,
     TrendItem,
+    XAccount,
 )
 
 
@@ -28,6 +33,8 @@ _LIST_COLUMNS = {
     "competitor_accounts": "competitor_accounts_json",
     "rss_feeds": "rss_feeds_json",
 }
+_ACCOUNT_UPDATE_FIELDS = {"name", "handle", "enabled", "live_posting_enabled", "timezone"}
+_HANDLE_PATTERN = re.compile(r"[a-z0-9_]{1,15}")
 
 
 def _coerce_list(value: Any) -> list[str]:
@@ -51,9 +58,27 @@ def _coerce_list(value: Any) -> list[str]:
     return [str(value).strip()]
 
 
+def _normalize_handle(handle: str) -> str:
+    normalized = str(handle).strip().removeprefix("@").strip().lower()
+    if not _HANDLE_PATTERN.fullmatch(normalized):
+        raise ValueError("X account handle must contain 1-15 letters, numbers, or underscores")
+    return normalized
+
+
+def _account_from_row(row: Any) -> XAccount:
+    return XAccount(
+        **{
+            **dict(row),
+            "enabled": bool(row["enabled"]),
+            "live_posting_enabled": bool(row["live_posting_enabled"]),
+        }
+    )
+
+
 def _profile_from_row(row: Any) -> StartupProfile:
     return StartupProfile(
         id=row["id"],
+        x_account_id=row["x_account_id"],
         name=row["name"],
         domain=row["domain"],
         target_audience=json.loads(row["target_audience_json"]),
@@ -66,7 +91,6 @@ def _profile_from_row(row: Any) -> StartupProfile:
         trend_keywords=json.loads(row["trend_keywords_json"]),
         competitor_accounts=json.loads(row["competitor_accounts_json"]),
         rss_feeds=json.loads(row["rss_feeds_json"]),
-        timezone=row["timezone"],
         max_attempts=row["max_attempts"],
         approval_timeout_minutes=row["approval_timeout_minutes"],
         updated_at=row["updated_at"],
@@ -76,6 +100,7 @@ def _profile_from_row(row: Any) -> StartupProfile:
 def _context_from_row(row: Any) -> ContentContext:
     return ContentContext(
         id=row["id"],
+        x_account_id=row["x_account_id"],
         name=row["name"],
         purpose=row["purpose"],
         tone=row["tone"],
@@ -88,6 +113,7 @@ def _context_from_row(row: Any) -> ContentContext:
 def _schedule_from_row(row: Any) -> ScheduleSlot:
     return ScheduleSlot(
         id=row["id"],
+        x_account_id=row["x_account_id"],
         context_id=row["context_id"],
         slot_number=row["slot_number"],
         time_local=row["time_local"],
@@ -100,19 +126,240 @@ def _draft_from_row(row: Any) -> Draft:
     return Draft(**dict(row))
 
 
+def _connection_from_row(row: Any) -> IntegrationConnection:
+    return IntegrationConnection(
+        id=row["id"],
+        provider=row["provider"],
+        label=row["label"],
+        credentials_configured=bool(row["credentials_configured"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _binding_from_row(row: Any) -> AccountIntegration:
+    return AccountIntegration(
+        x_account_id=row["x_account_id"],
+        provider=row["provider"],
+        connection_id=row["connection_id"],
+        target_id=row["target_id"],
+        enabled=bool(row["enabled"]),
+        last_test_success=(
+            None if row["last_test_success"] is None else bool(row["last_test_success"])
+        ),
+        last_test_error=row["last_test_error"],
+        last_tested_at=row["last_tested_at"],
+    )
+
+
 class Repository:
     def __init__(self, database: Database):
         self.database = database
 
-    def get_profile(self) -> StartupProfile:
+    def list_accounts(self, enabled_only: bool = False) -> list[XAccount]:
+        query = "SELECT * FROM x_accounts"
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY id"
         with self.database.connection() as conn:
-            row = conn.execute("SELECT * FROM startup_profile WHERE id = 1").fetchone()
+            rows = conn.execute(query).fetchall()
+        return [_account_from_row(row) for row in rows]
+
+    def get_account(self, x_account_id: int) -> XAccount:
+        with self.database.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM x_accounts WHERE id = ?", (x_account_id,)
+            ).fetchone()
         if row is None:
-            raise RuntimeError("Startup profile is not initialized")
+            raise KeyError(f"Unknown X account: {x_account_id}")
+        return _account_from_row(row)
+
+    def create_account(
+        self,
+        name: str,
+        handle: str,
+        timezone: str,
+        copy_from_id: int | None = None,
+    ) -> XAccount:
+        normalized_name = str(name).strip()
+        normalized_handle = _normalize_handle(handle)
+        normalized_timezone = str(timezone).strip()
+        if not normalized_name:
+            raise ValueError("X account name is required")
+        if not normalized_timezone:
+            raise ValueError("X account timezone is required")
+        now = utc_now_iso()
+        try:
+            with self.database.connection() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO x_accounts (
+                        name, handle, enabled, live_posting_enabled, timezone, created_at, updated_at
+                    ) VALUES (?, ?, 1, 0, ?, ?, ?)
+                    """,
+                    (normalized_name, normalized_handle, normalized_timezone, now, now),
+                )
+                x_account_id = int(cursor.lastrowid)
+                if copy_from_id is not None:
+                    self._copy_account_configuration(
+                        conn,
+                        source_account_id=copy_from_id,
+                        target_account_id=x_account_id,
+                        target_timezone=normalized_timezone,
+                        created_at=now,
+                    )
+        except sqlite3.IntegrityError as exc:
+            if "x_accounts.handle" in str(exc):
+                raise ValueError(f"X account handle already exists: {normalized_handle}") from exc
+            raise
+        return self.get_account(x_account_id)
+
+    @staticmethod
+    def _copy_account_configuration(
+        conn: sqlite3.Connection,
+        *,
+        source_account_id: int,
+        target_account_id: int,
+        target_timezone: str,
+        created_at: str,
+    ) -> None:
+        source_profile = conn.execute(
+            "SELECT * FROM startup_profile WHERE x_account_id = ?", (source_account_id,)
+        ).fetchone()
+        if source_profile is None:
+            raise KeyError(f"Unknown source account configuration: {source_account_id}")
+        conn.execute(
+            """
+            INSERT INTO startup_profile (
+                x_account_id, name, domain, target_audience_json, problems_json, brand_voice,
+                public_info_json, never_reveal_json, content_pillars_json, banned_phrases_json,
+                trend_keywords_json, competitor_accounts_json, rss_feeds_json, timezone,
+                max_attempts, approval_timeout_minutes, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                target_account_id,
+                source_profile["name"],
+                source_profile["domain"],
+                source_profile["target_audience_json"],
+                source_profile["problems_json"],
+                source_profile["brand_voice"],
+                source_profile["public_info_json"],
+                source_profile["never_reveal_json"],
+                source_profile["content_pillars_json"],
+                source_profile["banned_phrases_json"],
+                source_profile["trend_keywords_json"],
+                source_profile["competitor_accounts_json"],
+                source_profile["rss_feeds_json"],
+                target_timezone,
+                source_profile["max_attempts"],
+                source_profile["approval_timeout_minutes"],
+                created_at,
+            ),
+        )
+
+        context_ids: dict[int, int] = {}
+        source_contexts = conn.execute(
+            "SELECT * FROM content_contexts WHERE x_account_id = ? ORDER BY id",
+            (source_account_id,),
+        ).fetchall()
+        for context in source_contexts:
+            cursor = conn.execute(
+                """
+                INSERT INTO content_contexts (
+                    x_account_id, name, purpose, tone, live_trends_required, instructions, enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target_account_id,
+                    context["name"],
+                    context["purpose"],
+                    context["tone"],
+                    context["live_trends_required"],
+                    context["instructions"],
+                    context["enabled"],
+                ),
+            )
+            context_ids[int(context["id"])] = int(cursor.lastrowid)
+
+        source_schedules = conn.execute(
+            "SELECT * FROM schedule_slots WHERE x_account_id = ? ORDER BY slot_number",
+            (source_account_id,),
+        ).fetchall()
+        for schedule in source_schedules:
+            conn.execute(
+                """
+                INSERT INTO schedule_slots (
+                    x_account_id, context_id, slot_number, time_local, enabled, last_run_date
+                ) VALUES (?, ?, ?, ?, ?, '')
+                """,
+                (
+                    target_account_id,
+                    context_ids[int(schedule["context_id"])],
+                    schedule["slot_number"],
+                    schedule["time_local"],
+                    schedule["enabled"],
+                ),
+            )
+
+        copied_profile = conn.execute(
+            "SELECT * FROM startup_profile WHERE x_account_id = ?", (target_account_id,)
+        ).fetchone()
+        snapshot = dict(copied_profile)
+        snapshot.pop("timezone", None)
+        conn.execute(
+            """
+            INSERT INTO config_versions (x_account_id, version, snapshot_json, created_at)
+            VALUES (?, 1, ?, ?)
+            """,
+            (target_account_id, json.dumps(snapshot, sort_keys=True), created_at),
+        )
+
+    def update_account(self, x_account_id: int, updates: dict[str, Any]) -> XAccount:
+        if not updates:
+            return self.get_account(x_account_id)
+        invalid = set(updates) - _ACCOUNT_UPDATE_FIELDS
+        if invalid:
+            raise ValueError(f"Unsupported X account fields: {sorted(invalid)}")
+        normalized = dict(updates)
+        if "name" in normalized:
+            normalized["name"] = str(normalized["name"]).strip()
+            if not normalized["name"]:
+                raise ValueError("X account name is required")
+        if "handle" in normalized:
+            normalized["handle"] = _normalize_handle(normalized["handle"])
+        if "timezone" in normalized:
+            normalized["timezone"] = str(normalized["timezone"]).strip()
+            if not normalized["timezone"]:
+                raise ValueError("X account timezone is required")
+        for field in ("enabled", "live_posting_enabled"):
+            if field in normalized:
+                normalized[field] = int(bool(normalized[field]))
+        normalized["updated_at"] = utc_now_iso()
+        columns = ", ".join(f"{field} = ?" for field in normalized)
+        params = [*normalized.values(), x_account_id]
+        try:
+            with self.database.connection() as conn:
+                conn.execute(f"UPDATE x_accounts SET {columns} WHERE id = ?", params)
+        except sqlite3.IntegrityError as exc:
+            if "x_accounts.handle" in str(exc):
+                raise ValueError("X account handle already exists") from exc
+            raise
+        return self.get_account(x_account_id)
+
+    def get_profile(self, x_account_id: int) -> StartupProfile:
+        with self.database.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM startup_profile WHERE x_account_id = ?", (x_account_id,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError(f"Startup profile is not initialized for account {x_account_id}")
         return _profile_from_row(row)
 
-    def update_profile(self, updates: dict[str, Any]) -> StartupProfile:
-        current = self.get_profile().model_dump()
+    def update_profile(self, x_account_id: int, updates: dict[str, Any]) -> StartupProfile:
+        current = self.get_profile(x_account_id).model_dump()
+        if "timezone" in updates:
+            raise ValueError("Timezone belongs to the X account, not the startup profile")
         current.update(updates)
         for field in _LIST_COLUMNS:
             current[field] = _coerce_list(current.get(field))
@@ -128,9 +375,9 @@ class Repository:
                     name = ?, domain = ?, target_audience_json = ?, problems_json = ?,
                     brand_voice = ?, public_info_json = ?, never_reveal_json = ?,
                     content_pillars_json = ?, banned_phrases_json = ?, trend_keywords_json = ?,
-                    competitor_accounts_json = ?, rss_feeds_json = ?, timezone = ?,
-                    max_attempts = ?, approval_timeout_minutes = ?, updated_at = ?
-                WHERE id = 1
+                    competitor_accounts_json = ?, rss_feeds_json = ?, max_attempts = ?,
+                    approval_timeout_minutes = ?, updated_at = ?
+                WHERE x_account_id = ?
                 """,
                 (
                     str(current["name"]).strip(),
@@ -145,58 +392,85 @@ class Repository:
                     json.dumps(current["trend_keywords"]),
                     json.dumps(current["competitor_accounts"]),
                     json.dumps(current["rss_feeds"]),
-                    str(current["timezone"]).strip(),
                     current["max_attempts"],
                     current["approval_timeout_minutes"],
                     now,
+                    x_account_id,
                 ),
             )
-            version = conn.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM config_versions").fetchone()[0]
-            row = conn.execute("SELECT * FROM startup_profile WHERE id = 1").fetchone()
+            version = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM config_versions WHERE x_account_id = ?",
+                (x_account_id,),
+            ).fetchone()[0]
+            row = conn.execute(
+                "SELECT * FROM startup_profile WHERE x_account_id = ?", (x_account_id,)
+            ).fetchone()
+            snapshot = dict(row)
+            snapshot.pop("timezone", None)
             conn.execute(
-                "INSERT INTO config_versions (version, snapshot_json, created_at) VALUES (?, ?, ?)",
-                (version, json.dumps(dict(row), sort_keys=True), now),
+                """
+                INSERT INTO config_versions (x_account_id, version, snapshot_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (x_account_id, version, json.dumps(snapshot, sort_keys=True), now),
             )
-        return self.get_profile()
+        return self.get_profile(x_account_id)
 
-    def current_config_version(self) -> int:
+    def current_config_version(self, x_account_id: int) -> int:
         with self.database.connection() as conn:
-            return int(conn.execute("SELECT COALESCE(MAX(version), 0) FROM config_versions").fetchone()[0])
+            return int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(version), 0) FROM config_versions WHERE x_account_id = ?",
+                    (x_account_id,),
+                ).fetchone()[0]
+            )
 
-    def list_config_versions(self, limit: int = 20) -> list[dict[str, Any]]:
+    def list_config_versions(
+        self, x_account_id: int, limit: int = 20
+    ) -> list[dict[str, Any]]:
         with self.database.connection() as conn:
             rows = conn.execute(
-                "SELECT version, snapshot_json, created_at FROM config_versions ORDER BY version DESC LIMIT ?",
-                (limit,),
+                """
+                SELECT version, snapshot_json, created_at FROM config_versions
+                WHERE x_account_id = ? ORDER BY version DESC LIMIT ?
+                """,
+                (x_account_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_contexts(self, enabled_only: bool = False) -> list[ContentContext]:
-        query = "SELECT * FROM content_contexts"
-        params: tuple[Any, ...] = ()
+    def list_contexts(
+        self, x_account_id: int, enabled_only: bool = False
+    ) -> list[ContentContext]:
+        query = "SELECT * FROM content_contexts WHERE x_account_id = ?"
+        params: list[Any] = [x_account_id]
         if enabled_only:
-            query += " WHERE enabled = 1"
+            query += " AND enabled = 1"
         query += " ORDER BY id"
         with self.database.connection() as conn:
             rows = conn.execute(query, params).fetchall()
         return [_context_from_row(row) for row in rows]
 
-    def get_context(self, context_id: int) -> ContentContext:
+    def get_context(self, x_account_id: int, context_id: int) -> ContentContext:
         with self.database.connection() as conn:
-            row = conn.execute("SELECT * FROM content_contexts WHERE id = ?", (context_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM content_contexts WHERE x_account_id = ? AND id = ?",
+                (x_account_id, context_id),
+            ).fetchone()
         if row is None:
-            raise KeyError(f"Unknown content context: {context_id}")
+            raise KeyError(f"Unknown content context for account {x_account_id}: {context_id}")
         return _context_from_row(row)
 
-    def update_context(self, context_id: int, updates: dict[str, Any]) -> ContentContext:
-        current = self.get_context(context_id).model_dump()
+    def update_context(
+        self, x_account_id: int, context_id: int, updates: dict[str, Any]
+    ) -> ContentContext:
+        current = self.get_context(x_account_id, context_id).model_dump()
         current.update(updates)
         with self.database.connection() as conn:
             conn.execute(
                 """
                 UPDATE content_contexts
                 SET name = ?, purpose = ?, tone = ?, live_trends_required = ?, instructions = ?, enabled = ?
-                WHERE id = ?
+                WHERE x_account_id = ? AND id = ?
                 """,
                 (
                     current["name"],
@@ -205,25 +479,34 @@ class Repository:
                     int(bool(current["live_trends_required"])),
                     current["instructions"],
                     int(bool(current["enabled"])),
+                    x_account_id,
                     context_id,
                 ),
             )
-        return self.get_context(context_id)
+        return self.get_context(x_account_id, context_id)
 
-    def list_schedules(self) -> list[ScheduleSlot]:
+    def list_schedules(self, x_account_id: int) -> list[ScheduleSlot]:
         with self.database.connection() as conn:
-            rows = conn.execute("SELECT * FROM schedule_slots ORDER BY slot_number").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM schedule_slots WHERE x_account_id = ? ORDER BY slot_number",
+                (x_account_id,),
+            ).fetchall()
         return [_schedule_from_row(row) for row in rows]
 
-    def get_schedule(self, schedule_id: int) -> ScheduleSlot:
+    def get_schedule(self, x_account_id: int, schedule_id: int) -> ScheduleSlot:
         with self.database.connection() as conn:
-            row = conn.execute("SELECT * FROM schedule_slots WHERE id = ?", (schedule_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM schedule_slots WHERE x_account_id = ? AND id = ?",
+                (x_account_id, schedule_id),
+            ).fetchone()
         if row is None:
-            raise KeyError(f"Unknown schedule slot: {schedule_id}")
+            raise KeyError(f"Unknown schedule slot for account {x_account_id}: {schedule_id}")
         return _schedule_from_row(row)
 
-    def update_schedule(self, schedule_id: int, updates: dict[str, Any]) -> ScheduleSlot:
-        current = self.get_schedule(schedule_id).model_dump()
+    def update_schedule(
+        self, x_account_id: int, schedule_id: int, updates: dict[str, Any]
+    ) -> ScheduleSlot:
+        current = self.get_schedule(x_account_id, schedule_id).model_dump()
         current.update(updates)
         time_local = str(current["time_local"])
         datetime.strptime(time_local, "%H:%M")
@@ -232,27 +515,29 @@ class Repository:
                 """
                 UPDATE schedule_slots
                 SET context_id = ?, time_local = ?, enabled = ?, last_run_date = ?
-                WHERE id = ?
+                WHERE x_account_id = ? AND id = ?
                 """,
                 (
                     int(current["context_id"]),
                     time_local,
                     int(bool(current["enabled"])),
                     str(current.get("last_run_date", "")),
+                    x_account_id,
                     schedule_id,
                 ),
             )
-        return self.get_schedule(schedule_id)
+        return self.get_schedule(x_account_id, schedule_id)
 
-    def mark_schedule_run(self, schedule_id: int, local_date: str) -> None:
+    def mark_schedule_run(self, x_account_id: int, schedule_id: int, local_date: str) -> None:
         with self.database.connection() as conn:
             conn.execute(
-                "UPDATE schedule_slots SET last_run_date = ? WHERE id = ?",
-                (local_date, schedule_id),
+                "UPDATE schedule_slots SET last_run_date = ? WHERE x_account_id = ? AND id = ?",
+                (local_date, x_account_id, schedule_id),
             )
 
     def add_trend(
         self,
+        x_account_id: int,
         title: str,
         summary: str,
         source: str = "manual",
@@ -263,14 +548,16 @@ class Repository:
         with self.database.connection() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO trends (title, summary, source, url, score, active, collected_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?)
+                INSERT INTO trends (
+                    x_account_id, title, summary, source, url, score, active, collected_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
                 """,
-                (title, summary, source, url, score, collected_at),
+                (x_account_id, title, summary, source, url, score, collected_at),
             )
             trend_id = cursor.lastrowid
         return TrendItem(
             id=trend_id,
+            x_account_id=x_account_id,
             title=title,
             summary=summary,
             source=source,
@@ -280,17 +567,22 @@ class Repository:
             collected_at=collected_at,
         )
 
-    def list_trends(self, limit: int = 20, active_only: bool = True) -> list[TrendItem]:
-        query = "SELECT * FROM trends"
+    def list_trends(
+        self, x_account_id: int, limit: int = 20, active_only: bool = True
+    ) -> list[TrendItem]:
+        query = "SELECT * FROM trends WHERE x_account_id = ?"
+        params: list[Any] = [x_account_id]
         if active_only:
-            query += " WHERE active = 1"
+            query += " AND active = 1"
         query += " ORDER BY score DESC, id DESC LIMIT ?"
+        params.append(limit)
         with self.database.connection() as conn:
-            rows = conn.execute(query, (limit,)).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [TrendItem(**{**dict(row), "active": bool(row["active"])}) for row in rows]
 
     def create_draft(
         self,
+        x_account_id: int,
         *,
         context_id: int,
         schedule_id: int | None,
@@ -313,13 +605,14 @@ class Repository:
             conn.execute(
                 """
                 INSERT INTO drafts (
-                    id, context_id, schedule_id, text, topic, source_summary, status,
-                    safety_status, similarity_score, attempt, parent_draft_id, config_version,
-                    expires_at, generator_provider, prompt_snapshot, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, x_account_id, context_id, schedule_id, text, topic, source_summary,
+                    status, safety_status, similarity_score, attempt, parent_draft_id,
+                    config_version, expires_at, generator_provider, prompt_snapshot, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     draft_id,
+                    x_account_id,
                     context_id,
                     schedule_id,
                     text,
@@ -337,52 +630,46 @@ class Repository:
                     created_at,
                 ),
             )
-        return self.get_draft(draft_id)
+        return self.get_draft(x_account_id, draft_id)
 
-    def get_draft(self, draft_id: str) -> Draft:
+    def get_draft(self, x_account_id: int, draft_id: str) -> Draft:
         with self.database.connection() as conn:
-            row = conn.execute("SELECT * FROM drafts WHERE id = ?", (str(draft_id),)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM drafts WHERE x_account_id = ? AND id = ?",
+                (x_account_id, str(draft_id)),
+            ).fetchone()
         if row is None:
-            raise KeyError(f"Unknown draft: {draft_id}")
+            raise KeyError(f"Unknown draft for account {x_account_id}: {draft_id}")
         return _draft_from_row(row)
 
-    def update_draft(self, draft_id: str, **updates: Any) -> Draft:
+    def update_draft(self, x_account_id: int, draft_id: str, **updates: Any) -> Draft:
         if not updates:
-            return self.get_draft(draft_id)
+            return self.get_draft(x_account_id, draft_id)
         allowed = {
-            "text",
-            "topic",
-            "source_summary",
-            "status",
-            "safety_status",
-            "similarity_score",
-            "expires_at",
-            "prompt_snapshot",
-            "rejection_reason",
-            "reviewer_notes",
-            "reviewer",
-            "approved_at",
-            "published_at",
-            "publisher_provider",
-            "external_post_id",
-            "post_url",
-            "error",
+            "text", "topic", "source_summary", "status", "safety_status",
+            "similarity_score", "expires_at", "prompt_snapshot", "rejection_reason",
+            "reviewer_notes", "reviewer", "approved_at", "published_at",
+            "publisher_provider", "external_post_id", "post_url", "error",
         }
         invalid = set(updates) - allowed
         if invalid:
             raise ValueError(f"Unsupported draft fields: {sorted(invalid)}")
         columns = ", ".join(f"{field} = ?" for field in updates)
-        params = list(updates.values()) + [str(draft_id)]
+        params = [*updates.values(), x_account_id, str(draft_id)]
         with self.database.connection() as conn:
-            conn.execute(f"UPDATE drafts SET {columns} WHERE id = ?", params)
-        return self.get_draft(draft_id)
+            conn.execute(
+                f"UPDATE drafts SET {columns} WHERE x_account_id = ? AND id = ?", params
+            )
+        return self.get_draft(x_account_id, draft_id)
 
-    def list_drafts(self, limit: int = 100, statuses: list[str] | None = None) -> list[Draft]:
-        query = "SELECT * FROM drafts"
-        params: list[Any] = []
+    def list_drafts(
+        self, x_account_id: int, limit: int = 100, statuses: list[str] | None = None
+    ) -> list[Draft]:
+        query = "SELECT * FROM drafts WHERE x_account_id = ?"
+        params: list[Any] = [x_account_id]
         if statuses:
             placeholders = ",".join("?" for _ in statuses)
-            query += f" WHERE status IN ({placeholders})"
+            query += f" AND status IN ({placeholders})"
             params.extend(statuses)
         query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
         params.append(limit)
@@ -390,23 +677,26 @@ class Repository:
             rows = conn.execute(query, params).fetchall()
         return [_draft_from_row(row) for row in rows]
 
-    def pending_expired_before(self, now_iso: str) -> list[Draft]:
+    def pending_expired_before(self, x_account_id: int, now_iso: str) -> list[Draft]:
         with self.database.connection() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM drafts
-                WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?
+                WHERE x_account_id = ? AND status = 'pending'
+                  AND expires_at IS NOT NULL AND expires_at <= ?
                 ORDER BY created_at
                 """,
-                (now_iso,),
+                (x_account_id, now_iso),
             ).fetchall()
         return [_draft_from_row(row) for row in rows]
 
-    def recent_draft_texts(self, limit: int = 100, exclude_id: str | None = None) -> list[str]:
-        query = "SELECT text FROM drafts"
-        params: list[Any] = []
+    def recent_draft_texts(
+        self, x_account_id: int, limit: int = 100, exclude_id: str | None = None
+    ) -> list[str]:
+        query = "SELECT text FROM drafts WHERE x_account_id = ?"
+        params: list[Any] = [x_account_id]
         if exclude_id:
-            query += " WHERE id != ?"
+            query += " AND id != ?"
             params.append(str(exclude_id))
         query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
         params.append(limit)
@@ -414,17 +704,22 @@ class Repository:
             rows = conn.execute(query, params).fetchall()
         return [row["text"] for row in rows]
 
-    def example_texts(self, statuses: list[str], limit: int = 6) -> list[str]:
+    def example_texts(self, x_account_id: int, statuses: list[str], limit: int = 6) -> list[str]:
         placeholders = ",".join("?" for _ in statuses)
         with self.database.connection() as conn:
             rows = conn.execute(
-                f"SELECT text FROM drafts WHERE status IN ({placeholders}) ORDER BY created_at DESC, rowid DESC LIMIT ?",
-                [*statuses, limit],
+                f"""
+                SELECT text FROM drafts
+                WHERE x_account_id = ? AND status IN ({placeholders})
+                ORDER BY created_at DESC, rowid DESC LIMIT ?
+                """,
+                [x_account_id, *statuses, limit],
             ).fetchall()
         return [row["text"] for row in rows]
 
     def create_feedback(
         self,
+        x_account_id: int,
         *,
         draft_id: str,
         decision: str,
@@ -437,14 +732,19 @@ class Repository:
         with self.database.connection() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO feedback (draft_id, decision, reason, notes, learned_rule, reviewer, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO feedback (
+                    x_account_id, draft_id, decision, reason, notes, learned_rule, reviewer, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (str(draft_id), decision, reason, notes, learned_rule, reviewer, created_at),
+                (
+                    x_account_id, str(draft_id), decision, reason, notes,
+                    learned_rule, reviewer, created_at,
+                ),
             )
             feedback_id = cursor.lastrowid
         return FeedbackRecord(
             id=feedback_id,
+            x_account_id=x_account_id,
             draft_id=str(draft_id),
             decision=decision,
             reason=reason,
@@ -454,13 +754,17 @@ class Repository:
             created_at=created_at,
         )
 
-    def list_feedback(self, limit: int = 50) -> list[FeedbackRecord]:
+    def list_feedback(self, x_account_id: int, limit: int = 50) -> list[FeedbackRecord]:
         with self.database.connection() as conn:
-            rows = conn.execute("SELECT * FROM feedback ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM feedback WHERE x_account_id = ? ORDER BY id DESC LIMIT ?",
+                (x_account_id, limit),
+            ).fetchall()
         return [FeedbackRecord(**dict(row)) for row in rows]
 
     def upsert_preference(
         self,
+        x_account_id: int,
         *,
         rule: str,
         source_feedback_id: int | None,
@@ -469,42 +773,171 @@ class Repository:
         normalized_rule = " ".join(rule.strip().split())
         now = utc_now_iso()
         with self.database.connection() as conn:
-            existing = conn.execute("SELECT id FROM preferences WHERE rule = ?", (normalized_rule,)).fetchone()
+            existing = conn.execute(
+                "SELECT id FROM preferences WHERE x_account_id = ? AND rule = ?",
+                (x_account_id, normalized_rule),
+            ).fetchone()
             if existing:
                 preference_id = existing["id"]
                 conn.execute(
-                    "UPDATE preferences SET weight = weight + ?, source_feedback_id = ?, updated_at = ?, active = 1 WHERE id = ?",
-                    (delta, source_feedback_id, now, preference_id),
+                    """
+                    UPDATE preferences SET
+                        weight = weight + ?, source_feedback_id = ?, updated_at = ?, active = 1
+                    WHERE x_account_id = ? AND id = ?
+                    """,
+                    (delta, source_feedback_id, now, x_account_id, preference_id),
                 )
             else:
                 cursor = conn.execute(
                     """
-                    INSERT INTO preferences (rule, weight, source_feedback_id, active, created_at, updated_at)
-                    VALUES (?, ?, ?, 1, ?, ?)
+                    INSERT INTO preferences (
+                        x_account_id, rule, weight, source_feedback_id, active, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?)
                     """,
-                    (normalized_rule, delta, source_feedback_id, now, now),
+                    (x_account_id, normalized_rule, delta, source_feedback_id, now, now),
                 )
                 preference_id = cursor.lastrowid
-            row = conn.execute("SELECT * FROM preferences WHERE id = ?", (preference_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM preferences WHERE x_account_id = ? AND id = ?",
+                (x_account_id, preference_id),
+            ).fetchone()
         return LearnedPreference(**{**dict(row), "active": bool(row["active"])})
 
-    def list_preferences(self, limit: int = 30, active_only: bool = True) -> list[LearnedPreference]:
-        query = "SELECT * FROM preferences"
+    def list_preferences(
+        self, x_account_id: int, limit: int = 30, active_only: bool = True
+    ) -> list[LearnedPreference]:
+        query = "SELECT * FROM preferences WHERE x_account_id = ?"
+        params: list[Any] = [x_account_id]
         if active_only:
-            query += " WHERE active = 1"
+            query += " AND active = 1"
         query += " ORDER BY weight DESC, updated_at DESC LIMIT ?"
+        params.append(limit)
         with self.database.connection() as conn:
-            rows = conn.execute(query, (limit,)).fetchall()
-        return [LearnedPreference(**{**dict(row), "active": bool(row["active"])}) for row in rows]
+            rows = conn.execute(query, params).fetchall()
+        return [
+            LearnedPreference(**{**dict(row), "active": bool(row["active"])}) for row in rows
+        ]
 
-    def log_event(self, event_type: str, draft_id: str | None, details: dict[str, Any]) -> None:
+    def log_event(
+        self,
+        x_account_id: int,
+        event_type: str,
+        draft_id: str | None,
+        details: dict[str, Any],
+    ) -> None:
         with self.database.connection() as conn:
             conn.execute(
-                "INSERT INTO event_log (event_type, draft_id, details_json, created_at) VALUES (?, ?, ?, ?)",
-                (event_type, str(draft_id) if draft_id else None, json.dumps(details, default=str), utc_now_iso()),
+                """
+                INSERT INTO event_log (
+                    x_account_id, event_type, draft_id, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    x_account_id,
+                    event_type,
+                    str(draft_id) if draft_id else None,
+                    json.dumps(details, default=str),
+                    utc_now_iso(),
+                ),
             )
 
-    def list_events(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_events(self, x_account_id: int, limit: int = 50) -> list[dict[str, Any]]:
         with self.database.connection() as conn:
-            rows = conn.execute("SELECT * FROM event_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM event_log WHERE x_account_id = ? ORDER BY id DESC LIMIT ?",
+                (x_account_id, limit),
+            ).fetchall()
         return [dict(row) for row in rows]
+
+    def create_integration_connection(
+        self, provider: str, label: str, encrypted_credentials: str
+    ) -> IntegrationConnection:
+        normalized_provider = str(provider).strip().lower()
+        now = utc_now_iso()
+        with self.database.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO integration_connections (
+                    provider, label, encrypted_credentials, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (normalized_provider, str(label).strip(), str(encrypted_credentials), now, now),
+            )
+            row = conn.execute(
+                """
+                SELECT id, provider, label,
+                       encrypted_credentials != '' AS credentials_configured,
+                       created_at, updated_at
+                FROM integration_connections WHERE id = ?
+                """,
+                (cursor.lastrowid,),
+            ).fetchone()
+        return _connection_from_row(row)
+
+    def get_encrypted_credentials(self, connection_id: int) -> str:
+        with self.database.connection() as conn:
+            row = conn.execute(
+                "SELECT encrypted_credentials FROM integration_connections WHERE id = ?",
+                (connection_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown integration connection: {connection_id}")
+        return str(row["encrypted_credentials"])
+
+    def bind_account_integration(
+        self,
+        x_account_id: int,
+        provider: str,
+        connection_id: int,
+        target_id: str,
+        enabled: bool = True,
+    ) -> AccountIntegration:
+        normalized_provider = str(provider).strip().lower()
+        with self.database.connection() as conn:
+            connection = conn.execute(
+                "SELECT id FROM integration_connections WHERE id = ? AND provider = ?",
+                (connection_id, normalized_provider),
+            ).fetchone()
+            if connection is None:
+                raise KeyError(
+                    f"Unknown {normalized_provider} integration connection: {connection_id}"
+                )
+            conn.execute(
+                """
+                INSERT INTO account_integrations (
+                    x_account_id, provider, connection_id, target_id, enabled,
+                    last_test_success, last_test_error, last_tested_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, '', NULL)
+                ON CONFLICT(x_account_id, provider) DO UPDATE SET
+                    connection_id = excluded.connection_id,
+                    target_id = excluded.target_id,
+                    enabled = excluded.enabled,
+                    last_test_success = NULL,
+                    last_test_error = '',
+                    last_tested_at = NULL
+                """,
+                (
+                    x_account_id,
+                    normalized_provider,
+                    connection_id,
+                    str(target_id).strip(),
+                    int(bool(enabled)),
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM account_integrations WHERE x_account_id = ? AND provider = ?
+                """,
+                (x_account_id, normalized_provider),
+            ).fetchone()
+        return _binding_from_row(row)
+
+    def get_account_integration(
+        self, x_account_id: int, provider: str
+    ) -> AccountIntegration | None:
+        with self.database.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM account_integrations WHERE x_account_id = ? AND provider = ?",
+                (x_account_id, str(provider).strip().lower()),
+            ).fetchone()
+        return _binding_from_row(row) if row is not None else None
