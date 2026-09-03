@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from app.repository import Repository
 from app.routes import api, slack, telegram, ui
 from app.services.factory import build_services
 from app.services.scheduler import SchedulerService
+from app.services.csrf import CsrfProtector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +57,9 @@ def create_app(settings: Settings | None = None, start_scheduler: bool | None = 
     app.state.repository = repository
     app.state.services = services
     app.state.scheduler = scheduler
+    app.state.csrf = CsrfProtector(
+        settings.app_csrf_secret or secrets.token_urlsafe(32)
+    )
 
     app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
     app.include_router(ui.router)

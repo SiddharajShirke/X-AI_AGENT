@@ -1019,6 +1019,24 @@ class Repository:
             raise KeyError(f"Unknown integration connection: {connection_id}")
         return _connection_from_row(row)
 
+    def list_integration_connections(
+        self, provider: str | None = None
+    ) -> list[IntegrationConnection]:
+        query = """
+            SELECT id, provider, label,
+                   encrypted_credentials != '' AS credentials_configured,
+                   created_at, updated_at
+            FROM integration_connections
+        """
+        params: list[Any] = []
+        if provider is not None:
+            query += " WHERE provider = ?"
+            params.append(str(provider).strip().lower())
+        query += " ORDER BY provider, label, id"
+        with self.database.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [_connection_from_row(row) for row in rows]
+
     def replace_integration_connection(
         self,
         connection_id: int,
