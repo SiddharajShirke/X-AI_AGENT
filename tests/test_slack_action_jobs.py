@@ -1,13 +1,456 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 
+import httpx
 import pytest
+from cryptography.fernet import Fernet
 
 from app.db import Database
-from app.models import SlackActionJob
+from app.models import PublishResult, SlackActionJob
 from app.repository import Repository
+from app.services.factory import build_services
+from app.services.slack_actions import SlackActionProcessor
+
+
+def _pending_draft(repository, account_id: int):
+    context = repository.list_contexts(account_id)[0]
+    return repository.create_draft(
+        account_id,
+        context_id=context.id,
+        schedule_id=None,
+        text="A pending post for explicit Slack review.",
+        topic="review",
+        source_summary="manual",
+        status="pending",
+        safety_status="safe",
+        similarity_score=0.1,
+        attempt=1,
+        parent_draft_id=None,
+        config_version=repository.current_config_version(account_id),
+        expires_at=None,
+        generator_provider="demo",
+        prompt_snapshot="",
+    )
+
+
+def _processor_services(settings, repository, handler):
+    configured = settings.model_copy(
+        update={
+            "app_encryption_key": Fernet.generate_key().decode(),
+            "buffer_live_posting": True,
+            "buffer_api_url": "https://buffer.test/graphql",
+            "slack_action_lease_seconds": 300,
+            "slack_action_poll_seconds": 0.1,
+        }
+    )
+    services = build_services(configured, repository)
+    services.publishers._client = httpx.Client(transport=httpx.MockTransport(handler))
+    return services
+
+
+def test_processor_approval_publishes_through_account_scoped_pipeline(
+    settings, repository
+):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "createPost": {
+                        "__typename": "PostActionSuccess",
+                        "post": {
+                            "id": "buffer-post-1",
+                            "externalLink": "https://buffer.test/post/1",
+                            "status": "sent",
+                            "shareMode": "shareNow",
+                            "channelId": "channel-1",
+                        },
+                    }
+                }
+            },
+            request=request,
+        )
+
+    services = _processor_services(settings, repository, handler)
+    account = repository.list_accounts()[0]
+    repository.update_account(account.id, {"live_posting_enabled": True})
+    buffer_connection = services.integrations.save_connection(
+        "buffer", "Buffer", {"api_key": "buffer-private-key"}
+    )
+    services.integrations.bind(
+        account.id, "buffer", buffer_connection.id, "channel-1"
+    )
+    slack_connection = repository.create_integration_connection(
+        "slack", "Slack", "encrypted"
+    )
+    pending = _pending_draft(repository, account.id)
+    job, _ = repository.enqueue_slack_action(
+        idempotency_key="processor-approval",
+        connection_id=slack_connection.id,
+        x_account_id=account.id,
+        draft_id=pending.id,
+        action_id="approve_draft",
+        expected_live=True,
+        reviewer="slack:U123:reviewer",
+    )
+    processor = SlackActionProcessor(
+        services.pipeline.settings,
+        repository,
+        services.pipeline,
+        services.notifiers,
+    )
+
+    processed = processor.tick()
+    draft = repository.get_draft(account.id, pending.id)
+    job = repository.get_slack_action_job(account.id, job.id)
+
+    assert processed == 1
+    assert len(requests) == 1
+    assert draft.status == "published"
+    assert draft.publisher_provider == "buffer"
+    assert job.status == "completed"
+    assert job.result_draft_id == draft.id
+    with repository.database.connection() as conn:
+        attempt = conn.execute(
+            "SELECT origin, reviewer FROM publish_attempts WHERE draft_id = ?",
+            (draft.id,),
+        ).fetchone()
+    assert dict(attempt) == {
+        "origin": "slack",
+        "reviewer": "slack:U123:reviewer",
+    }
+    slack_events = [
+        event
+        for event in reversed(repository.list_events(account.id))
+        if event["event_type"].startswith("slack_action_")
+    ]
+    assert [event["event_type"] for event in slack_events] == [
+        "slack_action_processing",
+        "slack_action_completed",
+    ]
+    assert json.loads(slack_events[-1]["details_json"]) == {
+        "x_account_id": account.id,
+        "job_id": job.id,
+        "action_id": "approve_draft",
+        "draft_id": draft.id,
+        "result_status": "published",
+        "provider": "buffer",
+    }
+
+
+def _live_processor_job(settings, repository, *, expected_live=True):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "createPost": {
+                        "__typename": "PostActionSuccess",
+                        "post": {
+                            "id": "buffer-post-recovery",
+                            "externalLink": None,
+                            "status": "sent",
+                            "shareMode": "shareNow",
+                            "channelId": "channel-recovery",
+                        },
+                    }
+                }
+            },
+            request=request,
+        )
+
+    services = _processor_services(settings, repository, handler)
+    account = repository.list_accounts()[0]
+    repository.update_account(account.id, {"live_posting_enabled": True})
+    buffer_connection = services.integrations.save_connection(
+        "buffer", "Buffer recovery", {"api_key": "buffer-recovery-key"}
+    )
+    services.integrations.bind(
+        account.id, "buffer", buffer_connection.id, "channel-recovery"
+    )
+    slack_connection = repository.create_integration_connection(
+        "slack", "Slack recovery", "encrypted"
+    )
+    draft = _pending_draft(repository, account.id)
+    job, _ = repository.enqueue_slack_action(
+        idempotency_key="processor-recovery",
+        connection_id=slack_connection.id,
+        x_account_id=account.id,
+        draft_id=draft.id,
+        action_id="approve_draft",
+        expected_live=expected_live,
+        reviewer="slack:U123:reviewer",
+    )
+    return services, account, slack_connection, draft, job, requests
+
+
+def _make_job_stale(repository, job_id):
+    claimed = repository.claim_next_slack_action("2000-01-01T00:00:00+00:00")
+    assert claimed is not None and claimed.id == job_id
+    with repository.database.connection() as conn:
+        conn.execute(
+            "UPDATE slack_action_jobs SET claimed_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", job_id),
+        )
+
+
+def test_processor_recovers_stale_pending_job(settings, repository):
+    services, account, _, draft, job, requests = _live_processor_job(
+        settings, repository
+    )
+    _make_job_stale(repository, job.id)
+
+    processed = services.slack_actions.tick()
+
+    assert processed == 1
+    assert len(requests) == 1
+    assert repository.get_draft(account.id, draft.id).status == "published"
+    assert repository.get_slack_action_job(account.id, job.id).status == "completed"
+
+
+def test_processor_recovers_published_job_without_republication(settings, repository):
+    services, account, _, draft, job, requests = _live_processor_job(
+        settings, repository
+    )
+    _make_job_stale(repository, job.id)
+    claimed = repository.claim_publish(
+        account.id,
+        draft.id,
+        reviewer="slack:U123:reviewer",
+        origin="slack",
+    )
+    assert claimed is not None
+    _, attempt = claimed
+    repository.complete_publish(
+        account.id,
+        draft.id,
+        attempt.id,
+        PublishResult(
+            success=True,
+            provider="buffer",
+            external_post_id="already-published",
+        ),
+    )
+
+    processed = services.slack_actions.tick()
+
+    recovered = repository.get_slack_action_job(account.id, job.id)
+    assert processed == 1
+    assert requests == []
+    assert recovered.status == "completed"
+    assert recovered.result_draft_id == draft.id
+    with repository.database.connection() as conn:
+        attempts = conn.execute(
+            "SELECT COUNT(*) FROM publish_attempts WHERE draft_id = ?", (draft.id,)
+        ).fetchone()[0]
+    assert attempts == 1
+
+
+def test_processor_fails_stale_publishing_job_for_reconciliation(settings, repository):
+    services, account, _, draft, job, requests = _live_processor_job(
+        settings, repository
+    )
+    _make_job_stale(repository, job.id)
+    claimed = repository.claim_publish(
+        account.id,
+        draft.id,
+        reviewer="slack:U123:reviewer",
+        origin="slack",
+    )
+    assert claimed is not None
+
+    processed = services.slack_actions.tick()
+
+    recovered = repository.get_slack_action_job(account.id, job.id)
+    assert processed == 1
+    assert requests == []
+    assert recovered.status == "failed"
+    assert recovered.safe_error == (
+        "Publication was interrupted; operator reconciliation is required"
+    )
+    assert repository.get_draft(account.id, draft.id).status == "publishing"
+
+
+def test_processor_duplicate_callback_creates_one_publication_attempt(
+    settings, repository
+):
+    services, account, slack_connection, draft, job, requests = _live_processor_job(
+        settings, repository
+    )
+    duplicate, created = repository.enqueue_slack_action(
+        idempotency_key="processor-recovery",
+        connection_id=slack_connection.id,
+        x_account_id=account.id,
+        draft_id=draft.id,
+        action_id="approve_draft",
+        expected_live=True,
+        reviewer="slack:U123:reviewer",
+    )
+
+    processed = services.slack_actions.tick()
+
+    assert created is False
+    assert duplicate.id == job.id
+    assert processed == 1
+    assert len(requests) == 1
+    with repository.database.connection() as conn:
+        attempts = conn.execute(
+            "SELECT COUNT(*) FROM publish_attempts WHERE draft_id = ?", (draft.id,)
+        ).fetchone()[0]
+    assert attempts == 1
+
+
+def test_processor_normalizes_publication_mode_error(settings, repository):
+    services, account, _, _, job, requests = _live_processor_job(
+        settings, repository, expected_live=False
+    )
+
+    processed = services.slack_actions.tick()
+
+    failed = repository.get_slack_action_job(account.id, job.id)
+    assert processed == 1
+    assert requests == []
+    assert failed.status == "failed"
+    assert failed.safe_error == "Publication mode changed; request a fresh Slack review"
+
+
+def test_processor_rejection_regenerates_through_account_scoped_pipeline(
+    settings, repository
+):
+    def handler(request):
+        raise AssertionError("A rejection must not call Buffer")
+
+    services = _processor_services(settings, repository, handler)
+    account = repository.list_accounts()[0]
+    slack_connection = repository.create_integration_connection(
+        "slack", "Slack rejection", "encrypted"
+    )
+    pending = _pending_draft(repository, account.id)
+    job, _ = repository.enqueue_slack_action(
+        idempotency_key="processor-rejection",
+        connection_id=slack_connection.id,
+        x_account_id=account.id,
+        draft_id=pending.id,
+        action_id="reject_draft",
+        expected_live=False,
+        reviewer="slack:U123:reviewer",
+    )
+
+    processed = services.slack_actions.tick()
+
+    original = repository.get_draft(account.id, pending.id)
+    completed = repository.get_slack_action_job(account.id, job.id)
+    replacement = repository.get_draft(account.id, completed.result_draft_id)
+    assert processed == 1
+    assert original.status == "rejected"
+    assert replacement.status == "pending"
+    assert replacement.parent_draft_id == original.id
+    assert completed.status == "completed"
+
+
+def test_processor_does_not_persist_or_log_unexpected_exception_text(
+    settings, repository, monkeypatch, caplog
+):
+    services, account, _, _, job, requests = _live_processor_job(settings, repository)
+
+    def fail_approval(*args, **kwargs):
+        raise RuntimeError("raw-secret-provider-response")
+
+    monkeypatch.setattr(services.pipeline, "approve", fail_approval)
+
+    processed = services.slack_actions.tick()
+
+    failed = repository.get_slack_action_job(account.id, job.id)
+    assert processed == 1
+    assert requests == []
+    assert failed.status == "failed"
+    assert failed.safe_error == "Unexpected Slack action processing failure"
+    assert "raw-secret-provider-response" not in caplog.text
+    assert "raw-secret-provider-response" not in json.dumps(
+        repository.list_events(account.id)
+    )
+
+
+def test_processor_stop_during_tick_ends_worker_without_waiting_for_poll(
+    settings, repository, monkeypatch
+):
+    services = build_services(
+        settings.model_copy(
+            update={
+                "slack_action_lease_seconds": 300,
+                "slack_action_poll_seconds": 60.0,
+            }
+        ),
+        repository,
+    )
+    processor = services.slack_actions
+
+    def stopping_tick():
+        processor.stop()
+        return 0
+
+    monkeypatch.setattr(processor, "tick", stopping_tick)
+
+    async def run_worker():
+        await asyncio.wait_for(processor.run_forever(), timeout=0.5)
+
+    asyncio.run(run_worker())
+
+
+def test_processor_wake_during_tick_triggers_next_tick_without_poll_delay(
+    settings, repository, monkeypatch
+):
+    services = build_services(
+        settings.model_copy(
+            update={
+                "slack_action_lease_seconds": 300,
+                "slack_action_poll_seconds": 60.0,
+            }
+        ),
+        repository,
+    )
+    processor = services.slack_actions
+    first_tick_started = Event()
+    release_first_tick = Event()
+    second_tick_finished = Event()
+    calls = 0
+
+    def controlled_tick():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_tick_started.set()
+            assert release_first_tick.wait(timeout=2)
+        else:
+            second_tick_finished.set()
+            processor.stop()
+        return 0
+
+    monkeypatch.setattr(processor, "tick", controlled_tick)
+
+    async def run_worker():
+        worker = asyncio.create_task(processor.run_forever())
+        try:
+            assert await asyncio.to_thread(first_tick_started.wait, 1)
+            processor.wake()
+            release_first_tick.set()
+            assert await asyncio.to_thread(second_tick_finished.wait, 1)
+            await asyncio.wait_for(worker, timeout=0.5)
+        finally:
+            processor.stop()
+            await asyncio.wait_for(worker, timeout=0.5)
+
+    asyncio.run(run_worker())
 
 
 def test_enqueue_slack_action_is_idempotent_and_secret_free(repository):

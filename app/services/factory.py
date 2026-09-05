@@ -12,6 +12,7 @@ from app.services.pipeline import Pipeline
 from app.services.publishers import PublisherManager
 from app.services.safety import SafetyGuard
 from app.services.similarity import SimilarityGuard
+from app.services.slack_actions import SlackActionProcessor
 from app.services.trends import TrendCollector
 
 
@@ -26,6 +27,7 @@ class Services:
     notifiers: NotifierManager
     publishers: PublisherManager
     integrations: IntegrationService
+    slack_actions: SlackActionProcessor
 
 
 def build_services(settings: Settings, repository: Repository) -> Services:
@@ -49,6 +51,7 @@ def build_services(settings: Settings, repository: Repository) -> Services:
         notifiers,
         publishers,
     )
+    slack_actions = SlackActionProcessor(settings, repository, pipeline, notifiers)
     return Services(
         pipeline=pipeline,
         generator=generator,
@@ -59,4 +62,5 @@ def build_services(settings: Settings, repository: Repository) -> Services:
         notifiers=notifiers,
         publishers=publishers,
         integrations=integrations,
+        slack_actions=slack_actions,
     )

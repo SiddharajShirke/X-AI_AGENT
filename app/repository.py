@@ -1307,6 +1307,13 @@ class Repository:
             row = conn.execute(
                 "SELECT * FROM slack_action_jobs WHERE id = ?", (candidate["id"],)
             ).fetchone()
+            self._log_slack_action_event(
+                conn,
+                "slack_action_processing",
+                row,
+                result_status="processing",
+                provider="",
+            )
         return _slack_action_from_row(row)
 
     def complete_slack_action(
@@ -1328,6 +1335,28 @@ class Repository:
             )
             if cursor.rowcount != 1:
                 raise KeyError(f"Slack action job is not processing: {job_id}")
+            row = conn.execute(
+                "SELECT * FROM slack_action_jobs WHERE x_account_id = ? AND id = ?",
+                (x_account_id, job_id),
+            ).fetchone()
+            result = conn.execute(
+                """
+                SELECT status, publisher_provider FROM drafts
+                WHERE x_account_id = ? AND id = ?
+                """,
+                (x_account_id, str(result_draft_id)),
+            ).fetchone()
+            self._log_slack_action_event(
+                conn,
+                "slack_action_completed",
+                row,
+                result_status=str(result["status"]) if result is not None else "",
+                provider=(
+                    str(result["publisher_provider"] or "")
+                    if result is not None
+                    else ""
+                ),
+            )
         return self.get_slack_action_job(x_account_id, job_id)
 
     def fail_slack_action(
@@ -1344,7 +1373,50 @@ class Repository:
             )
             if cursor.rowcount != 1:
                 raise KeyError(f"Slack action job is not processing: {job_id}")
+            row = conn.execute(
+                "SELECT * FROM slack_action_jobs WHERE x_account_id = ? AND id = ?",
+                (x_account_id, job_id),
+            ).fetchone()
+            self._log_slack_action_event(
+                conn,
+                "slack_action_failed",
+                row,
+                result_status="failed",
+                provider="",
+            )
         return self.get_slack_action_job(x_account_id, job_id)
+
+    @staticmethod
+    def _log_slack_action_event(
+        conn,
+        event_type: str,
+        job_row,
+        *,
+        result_status: str,
+        provider: str,
+    ) -> None:
+        details = {
+            "x_account_id": int(job_row["x_account_id"]),
+            "job_id": int(job_row["id"]),
+            "action_id": str(job_row["action_id"]),
+            "draft_id": str(job_row["draft_id"]),
+            "result_status": str(result_status),
+            "provider": str(provider),
+        }
+        conn.execute(
+            """
+            INSERT INTO event_log (
+                x_account_id, event_type, draft_id, details_json, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                details["x_account_id"],
+                event_type,
+                details["draft_id"],
+                json.dumps(details),
+                utc_now_iso(),
+            ),
+        )
 
     def record_integration_test(
         self,
