@@ -48,3 +48,5 @@ Connection responses include label and `credentials_configured`; they never incl
 - `POST /integrations/telegram/webhook`
 
 Slack action bodies are parsed only after signature verification. Slack values contain both `x_account_id` and `draft_id`, and the route verifies that the URL connection is the account's enabled binding.
+
+The Slack callback URL must be copied exactly from **Connections** for the saved Slack connection: `https://your-public-origin/integrations/slack/<connection-id>/actions`. Use the same Slack app as the incoming webhook, with Socket Mode Off and Interactivity & Shortcuts On. An outbound webhook test does not exercise this endpoint; a verified human click does.

@@ -19,7 +19,12 @@
 - Deterministic disclosure/style checks rather than enterprise DLP.
 - Text-only Buffer publication without provider reconciliation, media, or threads.
 - Direct outbound webhooks with limited retry handling.
+- No multi-instance, horizontal-scaling, distributed-worker, or leader-election safety. Run exactly one application instance against the persistent SQLite database.
 - No automated backup, monitoring, retention policy, or disaster recovery.
+
+## Slack callback deployment boundary
+
+Slack Interactivity is an inbound HTTP boundary. Configure the exact callback URL displayed in **Connections** in the same Slack app that owns the incoming webhook, with Socket Mode Off and Interactivity & Shortcuts On. Socket Mode does not route interactions to this HTTP callback. The dashboard's webhook test proves outbound delivery only, so it is not evidence of inbound callback readiness. A public-origin change requires a Slack Request URL update before clicks can reach the application.
 
 Keep `.env`, SQLite files, and backups private. If `APP_ENCRYPTION_KEY` is lost, saved integrations cannot be recovered. Never paste API keys, source code, raw customer data, legal secrets, or a complete unreleased specification into startup content fields. `never_reveal` should contain high-level prohibited topics or recognizable phrases.
 

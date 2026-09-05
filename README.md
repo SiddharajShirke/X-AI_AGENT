@@ -66,6 +66,8 @@ For each Slack app/connection:
 
 Slack messages contain the account handle, draft, Approve, Reject + regenerate, and Edit-in-dashboard actions. Incoming actions must have a valid Slack HMAC signature less than five minutes old and must match the account's bound connection. Repeated approval callbacks cannot publish twice.
 
+Slack uses HTTP Interactivity, not Socket Mode. Use the same Slack app for the incoming webhook and the callback: Socket Mode must be **Off**, and **Interactivity & Shortcuts** must be **On**. Copy the exact per-connection URL shown in **Connections** into Slack. The **Test outbound Slack message** control proves only that the webhook can post outbound; it does not prove that Slack clicks reach this application. See [deployment instructions](docs/DEPLOYMENT.md#slack-http-callback-operation) for local/ngrok and deployed single-instance setup.
+
 ## Buffer publishing
 
 The application publishes only through Buffer; the optional X bearer token is used only for trend research.

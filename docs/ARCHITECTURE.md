@@ -39,6 +39,10 @@ Reusable `integration_connections` contain Fernet-encrypted provider credentials
 
 Approval first performs a conditional SQLite update from `pending` to `publishing` and inserts a publication-attempt row in the same transaction. Only the winner calls Buffer. Repeated or overlapping approvals observe the existing state. A retry claims only `failed` and requires a new explicit action.
 
+## Slack HTTP callback operation
+
+Slack's incoming webhook and Interactivity callback use the same Slack app. The outgoing webhook is only a notification transport; verified HTTP callbacks are accepted at the exact per-connection URL `BASE_URL/integrations/slack/<connection-id>/actions`, then persisted before the single-process worker performs lifecycle work. Socket Mode must be Off and Interactivity & Shortcuts must be On, because Socket Mode does not route interactions to this HTTP endpoint. The webhook test is outbound-only; callback readiness requires an actual verified click.
+
 ## Adapter selection
 
 - Generation: Groq when configured; deterministic demo writer otherwise.
@@ -46,4 +50,4 @@ Approval first performs a conditional SQLite update from `pending` to `publishin
 - Review delivery: dashboard always, account-bound Slack when configured, optional Telegram.
 - Trends: stored/manual, optional RSS/X, then demo signals when none exist.
 
-The scheduler is single-process and SQLite-backed. Horizontal scaling and distributed scheduling are outside this prototype.
+The scheduler and Slack action worker are single-process and SQLite-backed. Run exactly one application instance against a persistent database; horizontal scaling, distributed scheduling, and multi-instance worker safety are outside this prototype.

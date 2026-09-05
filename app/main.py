@@ -13,6 +13,7 @@ from app.config import Settings
 from app.db import Database
 from app.repository import Repository
 from app.routes import api, slack, telegram, ui
+from app.runtime_validation import deployment_warnings
 from app.services.factory import build_services
 from app.services.scheduler import SchedulerService
 from app.services.csrf import CsrfProtector
@@ -23,6 +24,7 @@ logging.basicConfig(
 )
 
 APP_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -31,6 +33,8 @@ def create_app(
     start_slack_worker: bool | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
+    for warning in deployment_warnings(settings):
+        logger.warning("Deployment warning: %s", warning)
     database = Database(settings.database_path)
     database.initialize()
     repository = Repository(database)
