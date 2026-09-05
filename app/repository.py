@@ -1185,31 +1185,57 @@ class Repository:
     ) -> tuple[SlackActionJob, bool]:
         if action_id not in {"approve_draft", "reject_draft"}:
             raise ValueError("Unsupported Slack action")
+        normalized_connection_id = int(connection_id)
+        normalized_account_id = int(x_account_id)
+        normalized_draft_id = str(draft_id)
+        normalized_expected_live = bool(expected_live)
+        normalized_reviewer = str(reviewer)
         with self.database.connection() as conn:
+            draft = conn.execute(
+                "SELECT id FROM drafts WHERE x_account_id = ? AND id = ?",
+                (normalized_account_id, normalized_draft_id),
+            ).fetchone()
+            if draft is None:
+                raise ValueError("Draft does not belong to the X account")
             cursor = conn.execute(
                 """
-                INSERT OR IGNORE INTO slack_action_jobs (
+                INSERT INTO slack_action_jobs (
                     idempotency_key, connection_id, x_account_id, draft_id,
                     action_id, expected_live, reviewer, status, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
                 """,
                 (
                     idempotency_key,
-                    connection_id,
-                    x_account_id,
-                    str(draft_id),
+                    normalized_connection_id,
+                    normalized_account_id,
+                    normalized_draft_id,
                     action_id,
-                    int(expected_live),
-                    reviewer,
+                    int(normalized_expected_live),
+                    normalized_reviewer,
                     utc_now_iso(),
                 ),
             )
             created = cursor.rowcount == 1
             row = conn.execute(
-                "SELECT * FROM slack_action_jobs WHERE idempotency_key = ?",
-                (idempotency_key,),
+                """
+                SELECT * FROM slack_action_jobs
+                WHERE x_account_id = ? AND idempotency_key = ?
+                """,
+                (normalized_account_id, idempotency_key),
             ).fetchone()
-        return _slack_action_from_row(row), created
+        if row is None:
+            raise ValueError("Slack action idempotency key conflicts with another account")
+        job = _slack_action_from_row(row)
+        if (
+            job.connection_id != normalized_connection_id
+            or job.draft_id != normalized_draft_id
+            or job.action_id != action_id
+            or job.expected_live != normalized_expected_live
+            or job.reviewer != normalized_reviewer
+        ):
+            raise ValueError("Slack action idempotency key conflicts with a different request")
+        return job, created
 
     def get_slack_action_job(
         self, x_account_id: int, job_id: int
