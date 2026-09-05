@@ -220,6 +220,29 @@ def test_groq_writer_uses_settings_groq_model(repository):
     assert call_kwargs["model"] == model
 
 
+def test_groq_writer_reserves_output_for_gpt_oss_post_text(repository):
+    """GPT-OSS must have enough low-effort budget left to emit the post."""
+    from app.services.generation import GroqWriter
+
+    class BudgetAwareCompletions:
+        def create(self, **kwargs):
+            enough_output = kwargs.get("max_completion_tokens", 0) >= 512
+            low_reasoning = kwargs.get("reasoning_effort") == "low"
+            content = "A distinct post ready for human review." if enough_output and low_reasoning else ""
+            return _make_groq_response(content)
+
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=BudgetAwareCompletions())
+    )
+    settings = _make_settings_with_groq(model="openai/gpt-oss-120b")
+    data = GenerationInput(attempt=1, **_base(repository))
+
+    result = GroqWriter(settings, client=fake_client).generate(data)
+
+    assert result.provider == "groq"
+    assert result.text == "A distinct post ready for human review."
+
+
 def test_groq_writer_extracts_choices_0_message_content(repository):
     """GroqWriter must use choices[0].message.content as the post text."""
     from app.services.generation import GroqWriter

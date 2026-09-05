@@ -201,15 +201,60 @@ class IntegrationService:
             target = self.resolve_buffer(account_id)
             if target is None:
                 raise IntegrationError("Buffer connection is not enabled")
-            response = self._client.post(
-                self.settings.buffer_api_url.rstrip("/"),
-                json={"query": "query Channels { channels { id } }"},
-                headers={"Authorization": f"Bearer {target.api_key}"},
+            endpoint = self.settings.buffer_api_url.rstrip("/")
+            headers = {"Authorization": f"Bearer {target.api_key}"}
+            organization_response = self._client.post(
+                endpoint,
+                json={
+                    "query": (
+                        "query GetOrganizations { "
+                        "account { organizations { id } } "
+                        "}"
+                    )
+                },
+                headers=headers,
             )
-            response.raise_for_status()
-            payload: Any = response.json()
-            channels = ((payload or {}).get("data") or {}).get("channels") or []
-            if target.channel_id not in {str(item.get("id")) for item in channels}:
+            organization_response.raise_for_status()
+            organization_payload: Any = organization_response.json()
+            if (organization_payload or {}).get("errors"):
+                raise IntegrationError("Buffer organization lookup failed")
+            organizations = (
+                (((organization_payload or {}).get("data") or {}).get("account") or {})
+                .get("organizations")
+                or []
+            )
+            organization_ids = [
+                str(item.get("id", "")).strip()
+                for item in organizations
+                if str(item.get("id", "")).strip()
+            ]
+            if not organization_ids:
+                raise IntegrationError("No Buffer organization is accessible")
+
+            accessible_channel_ids: set[str] = set()
+            for organization_id in organization_ids:
+                response = self._client.post(
+                    endpoint,
+                    json={
+                        "query": (
+                            "query GetChannels($organizationId: OrganizationId!) { "
+                            "channels(input: { organizationId: $organizationId }) { id } "
+                            "}"
+                        ),
+                        "variables": {"organizationId": organization_id},
+                    },
+                    headers=headers,
+                )
+                response.raise_for_status()
+                payload: Any = response.json()
+                if (payload or {}).get("errors"):
+                    raise IntegrationError("Buffer channel lookup failed")
+                channels = ((payload or {}).get("data") or {}).get("channels") or []
+                accessible_channel_ids.update(
+                    str(item.get("id")) for item in channels if item.get("id")
+                )
+
+            if target.channel_id not in accessible_channel_ids:
                 raise IntegrationError("Configured Buffer channel is not accessible")
             return self._record_test(account_id, "buffer", success=True)
         except Exception as exc:
@@ -227,7 +272,15 @@ class IntegrationService:
                 target.webhook_url,
                 json={"text": "Startup X Agent connection test — no draft was published"},
             )
-            response.raise_for_status()
+            if not response.is_success:
+                if response.status_code == 404 and response.text.strip() == "no_service":
+                    raise IntegrationError(
+                        "Slack webhook is inactive or revoked; create a new Incoming "
+                        "Webhook and replace this connection"
+                    )
+                raise IntegrationError(
+                    f"Slack webhook returned HTTP {response.status_code}"
+                )
             return self._record_test(account_id, "slack", success=True)
         except Exception as exc:
             error = str(exc) if isinstance(exc, IntegrationError) else "Slack connection test failed"

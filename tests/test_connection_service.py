@@ -36,6 +36,18 @@ def integration_service(settings, repository, captured_requests):
         captured_requests.append(request)
         if "hooks.slack.test" in str(request.url):
             return httpx.Response(200, text="ok")
+        body = json.loads(request.content)
+        if "organizations" in body.get("query", ""):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "account": {
+                            "organizations": [{"id": "organization-a"}]
+                        }
+                    }
+                },
+            )
         return httpx.Response(
             200,
             json={"data": {"channels": [{"id": "channel-a"}, {"id": "channel-b"}]}},
@@ -75,9 +87,12 @@ def test_buffer_connection_test_is_read_only(
     result = integration_service.test_buffer(accounts[0].id)
 
     assert result.success is True
-    assert len(captured_requests) == 1
-    assert "createPost" not in captured_requests[0].content.decode()
-    assert "buffer-secret" not in captured_requests[0].content.decode()
+    assert len(captured_requests) == 2
+    assert all("createPost" not in request.content.decode() for request in captured_requests)
+    assert all("buffer-secret" not in request.content.decode() for request in captured_requests)
+    assert json.loads(captured_requests[1].content)["variables"] == {
+        "organizationId": "organization-a"
+    }
 
 
 def test_buffer_test_accepts_documented_account_id_keyword(
@@ -89,6 +104,59 @@ def test_buffer_test_accepts_documented_account_id_keyword(
     integration_service.bind(accounts[0].id, "buffer", connection.id, "channel-a")
 
     assert integration_service.test_buffer(account_id=accounts[0].id).success is True
+
+
+def test_buffer_test_uses_organization_scoped_channels_api(settings, repository, accounts):
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        if "organizations" in body.get("query", ""):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "account": {
+                            "organizations": [{"id": "organization-a"}]
+                        }
+                    }
+                },
+            )
+        if body.get("variables") == {"organizationId": "organization-a"}:
+            return httpx.Response(
+                200,
+                json={"data": {"channels": [{"id": "channel-a"}]}},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "errors": [
+                    {"message": "Field 'channels' argument 'input' is required"}
+                ]
+            },
+        )
+
+    configured = settings.model_copy(
+        update={
+            "app_encryption_key": Fernet.generate_key().decode(),
+            "buffer_api_url": "https://buffer.test/graphql",
+        }
+    )
+    service = IntegrationService(
+        configured,
+        repository,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    connection = service.save_connection("buffer", "Shared", {"api_key": "secret"})
+    service.bind(accounts[0].id, "buffer", connection.id, "channel-a")
+
+    result = service.test_buffer(accounts[0].id)
+
+    assert result.success is True
+    assert len(requests) == 2
+    assert requests[1]["variables"] == {"organizationId": "organization-a"}
+    assert all("createPost" not in request["query"] for request in requests)
 
 
 def test_missing_master_key_locks_connection_operations(settings, repository):
@@ -162,6 +230,39 @@ def test_slack_test_is_labeled_and_credentials_are_replaceable(
     assert replaced.id == connection.id
     assert "secret" not in replaced.model_dump_json()
     assert integration_service.get_slack_connection(connection.id).signing_secret == "new-secret"
+
+
+def test_slack_test_explains_inactive_webhook_without_leaking_it(
+    settings, repository, accounts
+):
+    webhook_url = "https://hooks.slack.test/services/secret/path"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="no_service")
+
+    configured = settings.model_copy(
+        update={"app_encryption_key": Fernet.generate_key().decode()}
+    )
+    service = IntegrationService(
+        configured,
+        repository,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    connection = service.save_connection(
+        "slack",
+        "Review Slack",
+        {"webhook_url": webhook_url, "signing_secret": "signing-secret"},
+    )
+    service.bind(accounts[0].id, "slack", connection.id, "")
+
+    result = service.test_slack(accounts[0].id)
+
+    assert result.success is False
+    assert result.error == (
+        "Slack webhook is inactive or revoked; create a new Incoming Webhook "
+        "and replace this connection"
+    )
+    assert webhook_url not in result.error
 
 
 def test_disconnect_disables_binding_without_deleting_connection(

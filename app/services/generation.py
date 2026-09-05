@@ -162,16 +162,22 @@ class GroqWriter:
         )
 
         client = self._get_client()
-        response = client.chat.completions.create(
-            model=self.settings.groq_model,
-            messages=[
+        request = {
+            "model": self.settings.groq_model,
+            "messages": [
                 {"role": "system", "content": self._SYSTEM_MESSAGE},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.8,
-            max_completion_tokens=120,
-            n=1,
-        )
+            "temperature": 0.8,
+            "max_completion_tokens": 512,
+            "n": 1,
+        }
+        if self.settings.groq_model in {
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
+        }:
+            request["reasoning_effort"] = "low"
+        response = client.chat.completions.create(**request)
 
         raw_content: str = response.choices[0].message.content or ""
         if not raw_content.strip():
