@@ -241,7 +241,7 @@ def test_slack_delivery_failure_never_persists_or_logs_webhook_secret(
     assert secret_path not in caplog.text
 
 
-def test_valid_slack_approve_and_repeat_publish_once(settings):
+def test_valid_slack_approval_is_queued_for_processing(settings):
     from app.main import create_app
 
     app = create_app(settings=_configured_settings(settings), start_scheduler=False)
@@ -254,20 +254,17 @@ def test_valid_slack_approve_and_repeat_publish_once(settings):
         )
         url = f"/integrations/slack/{connection.id}/actions"
 
-        first = client.post(url, content=body, headers=headers)
-        second = client.post(url, content=body, headers=headers)
+        response = client.post(url, content=body, headers=headers)
 
-        assert first.status_code == 200
-        assert second.status_code == 200
-        assert app.state.repository.get_draft(account.id, draft.id).status == "published"
-        with app.state.database.connection() as connection_handle:
-            attempts = connection_handle.execute(
-                "SELECT COUNT(*) FROM publish_attempts WHERE draft_id = ?", (draft.id,)
-            ).fetchone()[0]
-        assert attempts == 1
+        assert response.status_code == 200
+        assert response.json()["text"] == "Approval received and queued for processing"
+        assert app.state.repository.get_draft(account.id, draft.id).status == "pending"
+        jobs = app.state.repository.list_slack_actions(account.id)
+        assert len(jobs) == 1
+        assert jobs[0].status == "pending"
 
 
-def test_slack_dry_run_approval_is_rejected_after_account_switches_live(settings):
+def test_slack_approval_is_queued_when_publication_mode_changes(settings):
     from app.main import create_app
 
     configured = _configured_settings(settings).model_copy(
@@ -297,12 +294,13 @@ def test_slack_dry_run_approval_is_rejected_after_account_switches_live(settings
             headers=headers,
         )
 
-        assert response.status_code == 409
-        assert "Publication mode changed" in response.json()["detail"]
+        assert response.status_code == 200
+        assert response.json()["text"] == "Approval received and queued for processing"
         assert app.state.repository.get_draft(account.id, draft.id).status == "pending"
+        assert len(app.state.repository.list_slack_actions(account.id)) == 1
 
 
-def test_slack_rejection_regenerates_for_same_account(settings):
+def test_slack_rejection_is_queued_for_processing(settings):
     from app.main import create_app
 
     app = create_app(settings=_configured_settings(settings), start_scheduler=False)
@@ -321,9 +319,12 @@ def test_slack_rejection_regenerates_for_same_account(settings):
         )
 
         assert response.status_code == 200
-        assert app.state.repository.get_draft(account.id, draft.id).status == "rejected"
-        replacement_id = response.json()["draft_id"]
-        assert app.state.repository.get_draft(account.id, replacement_id).parent_draft_id == draft.id
+        assert response.json()["text"] == "Rejection received and queued for processing"
+        assert app.state.repository.get_draft(account.id, draft.id).status == "pending"
+        jobs = app.state.repository.list_slack_actions(account.id)
+        assert len(jobs) == 1
+        assert jobs[0].status == "pending"
+        assert jobs[0].action_id == "reject_draft"
 
 
 def test_slack_rejects_invalid_and_stale_signatures(settings):
@@ -347,6 +348,7 @@ def test_slack_rejects_invalid_and_stale_signatures(settings):
         assert invalid.status_code == 403
         assert stale.status_code == 403
         assert app.state.repository.get_draft(account.id, draft.id).status == "pending"
+        assert app.state.repository.list_slack_actions(account.id) == []
 
 
 def test_slack_rejects_connection_account_mismatch(settings):
@@ -377,6 +379,7 @@ def test_slack_rejects_connection_account_mismatch(settings):
         assert bound.id != other.id
         assert response.status_code == 403
         assert repository.get_draft(account.id, draft.id).status == "pending"
+        assert repository.list_slack_actions(account.id) == []
 
 
 def test_slack_rejects_draft_account_mismatch(settings):
@@ -402,3 +405,108 @@ def test_slack_rejects_draft_account_mismatch(settings):
 
         assert response.status_code in {400, 404}
         assert repository.get_draft(second.id, second_draft.id).status == "pending"
+        assert repository.list_slack_actions(first.id) == []
+        assert repository.list_slack_actions(second.id) == []
+
+
+def test_slack_malformed_and_unsupported_actions_create_no_jobs(settings):
+    from app.main import create_app
+
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    with TestClient(app) as client:
+        account = app.state.repository.list_accounts()[0]
+        connection = _connect_slack(app, account.id)
+        draft = _pending(app, account.id)
+        malformed, malformed_headers = _signed_request(
+            {"actions": []}, "signing-secret"
+        )
+        unsupported, unsupported_headers = _signed_request(
+            _slack_payload("open_modal", account.id, draft.id), "signing-secret"
+        )
+        url = f"/integrations/slack/{connection.id}/actions"
+
+        malformed_response = client.post(
+            url, content=malformed, headers=malformed_headers
+        )
+        unsupported_response = client.post(
+            url, content=unsupported, headers=unsupported_headers
+        )
+
+        assert malformed_response.status_code == 400
+        assert unsupported_response.status_code == 400
+        assert app.state.repository.list_slack_actions(account.id) == []
+
+
+def test_duplicate_slack_delivery_returns_the_same_queued_job(settings):
+    from app.main import create_app
+
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    with TestClient(app) as client:
+        account = app.state.repository.list_accounts()[0]
+        connection = _connect_slack(app, account.id)
+        draft = _pending(app, account.id)
+        body, headers = _signed_request(
+            _slack_payload("approve_draft", account.id, draft.id), "signing-secret"
+        )
+        url = f"/integrations/slack/{connection.id}/actions"
+
+        first = client.post(url, content=body, headers=headers)
+        second = client.post(url, content=body, headers=headers)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert first.json()["job_id"] == second.json()["job_id"]
+        assert len(app.state.repository.list_slack_actions(account.id)) == 1
+
+
+def test_slack_reject_requires_an_explicit_publication_mode(settings):
+    from app.main import create_app
+
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    with TestClient(app) as client:
+        account = app.state.repository.list_accounts()[0]
+        connection = _connect_slack(app, account.id)
+        draft = _pending(app, account.id)
+        payload = _slack_payload("reject_draft", account.id, draft.id)
+        value = json.loads(payload["actions"][0]["value"])
+        del value["expected_live"]
+        payload["actions"][0]["value"] = json.dumps(value)
+        body, headers = _signed_request(payload, "signing-secret")
+
+        response = client.post(
+            f"/integrations/slack/{connection.id}/actions",
+            content=body,
+            headers=headers,
+        )
+
+        assert response.status_code == 400
+        assert app.state.repository.list_slack_actions(account.id) == []
+
+
+def test_slack_rejects_a_disabled_account_binding_without_a_job(settings):
+    from app.main import create_app
+
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    with TestClient(app) as client:
+        account = app.state.repository.list_accounts()[0]
+        connection = _connect_slack(app, account.id)
+        app.state.services.integrations.bind(
+            account.id,
+            "slack",
+            connection.id,
+            "review-channel",
+            enabled=False,
+        )
+        draft = _pending(app, account.id)
+        body, headers = _signed_request(
+            _slack_payload("approve_draft", account.id, draft.id), "signing-secret"
+        )
+
+        response = client.post(
+            f"/integrations/slack/{connection.id}/actions",
+            content=body,
+            headers=headers,
+        )
+
+        assert response.status_code == 403
+        assert app.state.repository.list_slack_actions(account.id) == []

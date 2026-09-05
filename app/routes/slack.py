@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, HTTPException, Request
 
 from app.services.integrations import IntegrationError
-from app.services.pipeline import PipelineError
 
 
 router = APIRouter(tags=["slack"])
@@ -63,38 +63,42 @@ async def slack_action(connection_id: int, request: Request):
             status_code=404, detail="Draft does not belong to this X account"
         ) from exc
 
-    pipeline = request.app.state.services.pipeline
-    try:
-        if action_id == "approve_draft":
-            expected_live = value.get("expected_live")
-            if not isinstance(expected_live, bool):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Approval mode is missing; request a fresh Slack review",
-                )
-            result = pipeline.approve(
-                x_account_id,
-                draft_id,
-                reviewer=reviewer,
-                origin="slack",
-                expected_live_posting=expected_live,
-            )
-        elif action_id == "reject_draft":
-            result = pipeline.reject_and_regenerate(
-                x_account_id,
-                draft_id,
-                reason="other",
-                notes="Rejected from Slack",
-                reviewer=reviewer,
-                origin="slack",
-            )
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported Slack action")
-    except PipelineError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if action_id not in {"approve_draft", "reject_draft"}:
+        raise HTTPException(status_code=400, detail="Unsupported Slack action")
+    expected_live = value.get("expected_live")
+    if not isinstance(expected_live, bool):
+        raise HTTPException(
+            status_code=400,
+            detail="Approval mode is missing; request a fresh Slack review",
+        )
+
+    idempotency_key = hashlib.sha256(
+        f"{connection_id}:".encode() + body
+    ).hexdigest()
+    job, created = repository.enqueue_slack_action(
+        idempotency_key=idempotency_key,
+        connection_id=connection_id,
+        x_account_id=x_account_id,
+        draft_id=draft_id,
+        action_id=action_id,
+        expected_live=expected_live,
+        reviewer=reviewer,
+    )
+    repository.log_event(
+        x_account_id,
+        "slack_action_received" if created else "slack_action_duplicate",
+        draft_id,
+        {"job_id": job.id, "action_id": action_id},
+    )
+    request.app.state.services.slack_actions.wake()
 
     return {
         "response_type": "ephemeral",
-        "text": "Action recorded",
-        "draft_id": result.id if result is not None else draft_id,
+        "replace_original": False,
+        "text": (
+            "Approval received and queued for processing"
+            if action_id == "approve_draft"
+            else "Rejection received and queued for processing"
+        ),
+        "job_id": job.id,
     }
