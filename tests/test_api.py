@@ -269,6 +269,155 @@ def test_connections_page_masks_all_saved_secrets(settings):
         assert "slack-private-secret" not in response.text
 
 
+def test_slack_callback_url_and_outbound_test_are_connection_specific(settings):
+    from cryptography.fernet import Fernet
+    from app.main import create_app
+
+    configured = settings.model_copy(
+        update={
+            "app_encryption_key": Fernet.generate_key().decode(),
+            "base_url": "https://review.example/",
+        }
+    )
+    with TestClient(create_app(settings=configured, start_scheduler=False)) as client:
+        repository = client.app.state.repository
+        account = repository.list_accounts()[0]
+        connection = client.app.state.services.integrations.save_connection(
+            "slack",
+            "Team Slack",
+            {
+                "webhook_url": "https://hooks.slack.test/private-value",
+                "signing_secret": "slack-private-secret",
+            },
+        )
+        client.app.state.services.integrations.bind(
+            account.id, "slack", connection.id, "#x-review"
+        )
+
+        connections = client.get(
+            f"/connections?account_id={account.id}", headers=_auth()
+        )
+        setup = client.get(f"/accounts/{account.id}/setup", headers=_auth())
+
+    callback_url = "https://review.example/integrations/slack/1/actions"
+    assert connections.status_code == 200
+    assert callback_url in connections.text
+    assert "Disable Socket Mode" in connections.text
+    assert "Interactivity &amp; Shortcuts must be On" in connections.text
+    assert setup.status_code == 200
+    assert callback_url in setup.text
+    assert "Test outbound Slack message" in setup.text
+    assert "Inbound actions: Not verified" in setup.text
+
+
+def test_slack_inbound_action_health_is_account_and_connection_scoped(settings):
+    from cryptography.fernet import Fernet
+    from app.main import create_app
+
+    configured = settings.model_copy(
+        update={"app_encryption_key": Fernet.generate_key().decode()}
+    )
+    with TestClient(create_app(settings=configured, start_scheduler=False)) as client:
+        repository = client.app.state.repository
+        first = repository.list_accounts()[0]
+        second = repository.create_account("Second", "second", "UTC", copy_from_id=first.id)
+        connection = client.app.state.services.integrations.save_connection(
+            "slack",
+            "Team Slack",
+            {
+                "webhook_url": "https://hooks.slack.test/private-value",
+                "signing_secret": "slack-private-secret",
+            },
+        )
+        service = client.app.state.services.integrations
+        service.bind(first.id, "slack", connection.id, "#first-review")
+        service.bind(second.id, "slack", connection.id, "#second-review")
+        draft = client.app.state.services.pipeline.generate_draft(
+            first.id, context_id=repository.list_contexts(first.id)[0].id
+        )
+        job, created = repository.enqueue_slack_action(
+            idempotency_key="digest-never-rendered",
+            connection_id=connection.id,
+            x_account_id=first.id,
+            draft_id=draft.id,
+            action_id="approve_draft",
+            expected_live=False,
+            reviewer="slack:reviewer",
+        )
+        claimed = repository.claim_next_slack_action("2000-01-01T00:00:00+00:00")
+        assert created is True
+        assert claimed is not None
+        completed = repository.complete_slack_action(
+            first.id, job.id, result_draft_id=draft.id
+        )
+
+        first_setup = client.get(f"/accounts/{first.id}/setup", headers=_auth())
+        second_setup = client.get(f"/accounts/{second.id}/setup", headers=_auth())
+
+    assert first_setup.status_code == 200
+    assert "Inbound actions: Completed" in first_setup.text
+    assert completed.completed_at in first_setup.text
+    assert "slack-private-secret" not in first_setup.text
+    assert "private-value" not in first_setup.text
+    assert "digest-never-rendered" not in first_setup.text
+    assert second_setup.status_code == 200
+    assert "Inbound actions: Not verified" in second_setup.text
+    assert completed.completed_at not in second_setup.text
+
+
+def test_slack_inbound_action_health_renders_received_and_failed_safely(settings):
+    from cryptography.fernet import Fernet
+    from app.main import create_app
+
+    configured = settings.model_copy(
+        update={"app_encryption_key": Fernet.generate_key().decode()}
+    )
+    with TestClient(create_app(settings=configured, start_scheduler=False)) as client:
+        repository = client.app.state.repository
+        account = repository.list_accounts()[0]
+        connection = client.app.state.services.integrations.save_connection(
+            "slack",
+            "Team Slack",
+            {
+                "webhook_url": "https://hooks.slack.test/private-value",
+                "signing_secret": "slack-private-secret",
+            },
+        )
+        client.app.state.services.integrations.bind(
+            account.id, "slack", connection.id, "#x-review"
+        )
+        draft = client.app.state.services.pipeline.generate_draft(
+            account.id, context_id=repository.list_contexts(account.id)[0].id
+        )
+        job, _ = repository.enqueue_slack_action(
+            idempotency_key="received-digest-never-rendered",
+            connection_id=connection.id,
+            x_account_id=account.id,
+            draft_id=draft.id,
+            action_id="reject_draft",
+            expected_live=False,
+            reviewer="slack:reviewer",
+        )
+
+        received = client.get(f"/accounts/{account.id}/setup", headers=_auth())
+        claimed = repository.claim_next_slack_action("2000-01-01T00:00:00+00:00")
+        assert claimed is not None
+        failed = repository.fail_slack_action(
+            account.id,
+            job.id,
+            "raw exception with response URL https://slack.test/private",
+        )
+        failed_response = client.get(f"/accounts/{account.id}/setup", headers=_auth())
+
+    assert "Inbound actions: Received" in received.text
+    assert job.created_at in received.text
+    assert "Inbound actions: Failed" in failed_response.text
+    assert failed.completed_at in failed_response.text
+    assert "raw exception" not in failed_response.text
+    assert "slack.test/private" not in failed_response.text
+    assert "received-digest-never-rendered" not in failed_response.text
+
+
 def test_account_without_copy_source_is_immediately_usable(settings):
     from app.main import create_app
 

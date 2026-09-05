@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from app.dependencies import get_pipeline, get_repository, require_admin
+from app.models import AccountIntegration, SlackActionJob
 from app.repository import Repository
 from app.services.integrations import IntegrationError
 from app.services.pipeline import Pipeline, PipelineError
@@ -36,6 +37,101 @@ def _form_error(exc: Exception) -> None:
     raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
+def _slack_inbound_health(action: SlackActionJob | None) -> dict[str, str]:
+    if action is None:
+        return {
+            "state": "Not verified",
+            "details": (
+                "No inbound Slack action has reached this connection for this X account yet. "
+                "Check the Slack app settings, then use an action from a Slack review."
+            ),
+        }
+    if action.status == "completed":
+        return {
+            "state": "Completed",
+            "details": (
+                f"Completed {action.completed_at or action.created_at}. "
+                "The inbound Slack action was applied to this account's review workflow."
+            ),
+        }
+    if action.status == "failed":
+        return {
+            "state": "Failed",
+            "details": (
+                f"Failed {action.completed_at or action.created_at}. "
+                "Review this account's draft state, then retry the action from Slack."
+            ),
+        }
+    return {
+        "state": "Received",
+        "details": (
+            f"Received {action.created_at}. "
+            "The inbound Slack action is awaiting processing; refresh shortly."
+        ),
+    }
+
+
+def _slack_outbound_health(binding: AccountIntegration | None) -> dict[str, str]:
+    if binding is None or not binding.enabled:
+        return {
+            "state": "Not connected",
+            "details": "Connect this Slack connection to send an outbound webhook test.",
+        }
+    if binding.last_test_success is True:
+        return {
+            "state": "Passed",
+            "details": f"Last tested {binding.last_tested_at}.",
+        }
+    if binding.last_test_success is False:
+        return {
+            "state": "Failed",
+            "details": (
+                f"Last tested {binding.last_tested_at}. "
+                "Review the Slack webhook configuration and test again."
+            ),
+        }
+    return {
+        "state": "Not tested",
+        "details": "Run an outbound webhook test after connecting this account.",
+    }
+
+
+def _slack_connection_context(
+    request: Request,
+    repository: Repository,
+    x_account_id: int,
+    slack_binding: AccountIntegration | None,
+) -> dict[str, object]:
+    base_url = request.app.state.settings.base_url.rstrip("/")
+    slack_connections = repository.list_integration_connections("slack")
+    slack_callback_urls = {
+        item.id: f"{base_url}/integrations/slack/{item.id}/actions"
+        for item in slack_connections
+    }
+    latest_slack_actions = {
+        item.id: repository.latest_slack_action(x_account_id, item.id)
+        for item in slack_connections
+    }
+    return {
+        "slack_connections": slack_connections,
+        "slack_callback_urls": slack_callback_urls,
+        "latest_slack_actions": latest_slack_actions,
+        "slack_inbound_health": {
+            connection_id: _slack_inbound_health(action)
+            for connection_id, action in latest_slack_actions.items()
+        },
+        "slack_outbound_healths": {
+            item.id: _slack_outbound_health(
+                slack_binding
+                if slack_binding is not None
+                and slack_binding.connection_id == item.id
+                else None
+            )
+            for item in slack_connections
+        },
+    }
+
+
 def _dashboard_context(request: Request, repository: Repository, x_account_id: int, reviewer: str):
     account = repository.get_account(x_account_id)
     profile = repository.get_profile(x_account_id)
@@ -47,6 +143,9 @@ def _dashboard_context(request: Request, repository: Repository, x_account_id: i
     slack_binding = repository.get_account_integration(x_account_id, "slack")
     buffer_status = _connection_status(request, x_account_id, "buffer")
     slack_status = _connection_status(request, x_account_id, "slack")
+    slack_connection_context = _slack_connection_context(
+        request, repository, x_account_id, slack_binding
+    )
     return {
         "account": account,
         "accounts": repository.list_accounts(),
@@ -72,10 +171,10 @@ def _dashboard_context(request: Request, repository: Repository, x_account_id: i
         "buffer_status": buffer_status,
         "slack_status": slack_status,
         "buffer_connections": repository.list_integration_connections("buffer"),
-        "slack_connections": repository.list_integration_connections("slack"),
         "settings": request.app.state.settings,
         "csrf_token": request.app.state.csrf.issue(reviewer),
         "message": request.query_params.get("message", ""),
+        **slack_connection_context,
     }
 
 
@@ -179,6 +278,10 @@ def connections_dashboard(
     accounts = repository.list_accounts()
     requested = request.query_params.get("account_id")
     return_account_id = int(requested) if requested and requested.isdigit() else accounts[0].id
+    slack_binding = repository.get_account_integration(return_account_id, "slack")
+    slack_connection_context = _slack_connection_context(
+        request, repository, return_account_id, slack_binding
+    )
     return templates.TemplateResponse(
         request=request,
         name="connections.html",
@@ -186,9 +289,11 @@ def connections_dashboard(
             "accounts": accounts,
             "connections": repository.list_integration_connections(),
             "return_account_id": return_account_id,
+            "slack_binding": slack_binding,
             "settings": request.app.state.settings,
             "csrf_token": request.app.state.csrf.issue(reviewer),
             "message": request.query_params.get("message", ""),
+            **slack_connection_context,
         },
     )
 
