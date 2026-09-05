@@ -33,6 +33,9 @@ class Settings(BaseSettings):
 
     scheduler_enabled: bool = True
     scheduler_poll_seconds: int = Field(default=20, ge=5, le=300)
+    slack_action_worker_enabled: bool = True
+    slack_action_poll_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
+    slack_action_lease_seconds: int = Field(default=300, ge=30, le=3600)
 
     # ---------------------------------------------------------------------------
     # Groq content generation

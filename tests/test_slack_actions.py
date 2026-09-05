@@ -244,7 +244,7 @@ def test_slack_delivery_failure_never_persists_or_logs_webhook_secret(
 def test_valid_slack_approval_is_queued_for_processing(settings):
     from app.main import create_app
 
-    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False, start_slack_worker=False)
     with TestClient(app) as client:
         account = app.state.repository.list_accounts()[0]
         connection = _connect_slack(app, account.id)
@@ -270,7 +270,7 @@ def test_slack_approval_is_queued_when_publication_mode_changes(settings):
     configured = _configured_settings(settings).model_copy(
         update={"buffer_live_posting": True}
     )
-    app = create_app(settings=configured, start_scheduler=False)
+    app = create_app(settings=configured, start_scheduler=False, start_slack_worker=False)
     with TestClient(app) as client:
         account = app.state.repository.list_accounts()[0]
         connection = _connect_slack(app, account.id)
@@ -303,7 +303,7 @@ def test_slack_approval_is_queued_when_publication_mode_changes(settings):
 def test_slack_rejection_is_queued_for_processing(settings):
     from app.main import create_app
 
-    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False, start_slack_worker=False)
     with TestClient(app) as client:
         account = app.state.repository.list_accounts()[0]
         connection = _connect_slack(app, account.id)
@@ -330,7 +330,7 @@ def test_slack_rejection_is_queued_for_processing(settings):
 def test_slack_rejects_invalid_and_stale_signatures(settings):
     from app.main import create_app
 
-    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False, start_slack_worker=False)
     with TestClient(app) as client:
         account = app.state.repository.list_accounts()[0]
         connection = _connect_slack(app, account.id)
@@ -354,7 +354,7 @@ def test_slack_rejects_invalid_and_stale_signatures(settings):
 def test_slack_rejects_connection_account_mismatch(settings):
     from app.main import create_app
 
-    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False, start_slack_worker=False)
     with TestClient(app) as client:
         repository = app.state.repository
         account = repository.list_accounts()[0]
@@ -385,7 +385,7 @@ def test_slack_rejects_connection_account_mismatch(settings):
 def test_slack_rejects_draft_account_mismatch(settings):
     from app.main import create_app
 
-    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False, start_slack_worker=False)
     with TestClient(app) as client:
         repository = app.state.repository
         first = repository.list_accounts()[0]
@@ -412,7 +412,7 @@ def test_slack_rejects_draft_account_mismatch(settings):
 def test_slack_malformed_and_unsupported_actions_create_no_jobs(settings):
     from app.main import create_app
 
-    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False, start_slack_worker=False)
     with TestClient(app) as client:
         account = app.state.repository.list_accounts()[0]
         connection = _connect_slack(app, account.id)
@@ -440,7 +440,7 @@ def test_slack_malformed_and_unsupported_actions_create_no_jobs(settings):
 def test_duplicate_slack_delivery_returns_the_same_queued_job(settings):
     from app.main import create_app
 
-    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False, start_slack_worker=False)
     with TestClient(app) as client:
         account = app.state.repository.list_accounts()[0]
         connection = _connect_slack(app, account.id)
@@ -462,7 +462,7 @@ def test_duplicate_slack_delivery_returns_the_same_queued_job(settings):
 def test_slack_reject_requires_an_explicit_publication_mode(settings):
     from app.main import create_app
 
-    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False, start_slack_worker=False)
     with TestClient(app) as client:
         account = app.state.repository.list_accounts()[0]
         connection = _connect_slack(app, account.id)
@@ -486,7 +486,7 @@ def test_slack_reject_requires_an_explicit_publication_mode(settings):
 def test_slack_rejects_a_disabled_account_binding_without_a_job(settings):
     from app.main import create_app
 
-    app = create_app(settings=_configured_settings(settings), start_scheduler=False)
+    app = create_app(settings=_configured_settings(settings), start_scheduler=False, start_slack_worker=False)
     with TestClient(app) as client:
         account = app.state.repository.list_accounts()[0]
         connection = _connect_slack(app, account.id)
@@ -510,3 +510,42 @@ def test_slack_rejects_a_disabled_account_binding_without_a_job(settings):
 
         assert response.status_code == 403
         assert app.state.repository.list_slack_actions(account.id) == []
+
+
+def test_lifespan_recovers_pending_slack_action_job(settings):
+    from app.main import create_app
+
+    configured = _configured_settings(settings).model_copy(
+        update={
+            "slack_action_worker_enabled": True,
+            "slack_action_poll_seconds": 0.1,
+        }
+    )
+    app = create_app(
+        settings=configured,
+        start_scheduler=False,
+    )
+    repository = app.state.repository
+    account = repository.list_accounts()[0]
+    draft = _pending(app, account.id)
+    connection = repository.create_integration_connection(
+        "slack", "Recovery", "encrypted"
+    )
+    job, _ = repository.enqueue_slack_action(
+        idempotency_key="lifespan-recovery",
+        connection_id=connection.id,
+        x_account_id=account.id,
+        draft_id=draft.id,
+        action_id="approve_draft",
+        expected_live=False,
+        reviewer="slack:U123:reviewer",
+    )
+
+    with TestClient(app):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if repository.get_slack_action_job(account.id, job.id).status == "completed":
+                break
+            time.sleep(0.01)
+
+    assert repository.get_slack_action_job(account.id, job.id).status == "completed"

@@ -25,26 +25,46 @@ logging.basicConfig(
 APP_DIR = Path(__file__).resolve().parent
 
 
-def create_app(settings: Settings | None = None, start_scheduler: bool | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    start_scheduler: bool | None = None,
+    start_slack_worker: bool | None = None,
+) -> FastAPI:
     settings = settings or Settings()
     database = Database(settings.database_path)
     database.initialize()
     repository = Repository(database)
     services = build_services(settings, repository)
     scheduler = SchedulerService(settings, repository, services.pipeline)
-    should_start = settings.scheduler_enabled if start_scheduler is None else start_scheduler
+    should_start_scheduler = (
+        settings.scheduler_enabled if start_scheduler is None else start_scheduler
+    )
+    should_start_slack_worker = (
+        settings.slack_action_worker_enabled
+        if start_slack_worker is None
+        else start_slack_worker
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        task: asyncio.Task | None = None
-        if should_start:
-            task = asyncio.create_task(scheduler.run_forever(), name="x-agent-scheduler")
+        tasks: list[asyncio.Task[None]] = []
+        if should_start_scheduler:
+            tasks.append(
+                asyncio.create_task(scheduler.run_forever(), name="x-agent-scheduler")
+            )
+        if should_start_slack_worker:
+            tasks.append(
+                asyncio.create_task(
+                    services.slack_actions.run_forever(), name="slack-action-worker"
+                )
+            )
         try:
             yield
         finally:
             scheduler.stop()
-            if task:
-                await task
+            services.slack_actions.stop()
+            if tasks:
+                await asyncio.gather(*tasks)
 
     app = FastAPI(
         title=settings.app_name,
@@ -57,6 +77,7 @@ def create_app(settings: Settings | None = None, start_scheduler: bool | None = 
     app.state.repository = repository
     app.state.services = services
     app.state.scheduler = scheduler
+    app.state.slack_actions = services.slack_actions
     app.state.csrf = CsrfProtector(
         settings.app_csrf_secret or secrets.token_urlsafe(32)
     )
