@@ -241,6 +241,25 @@ class Database:
                     PRIMARY KEY (x_account_id, provider)
                 );
 
+                CREATE TABLE IF NOT EXISTS slack_action_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    connection_id INTEGER NOT NULL REFERENCES integration_connections(id),
+                    x_account_id INTEGER NOT NULL REFERENCES x_accounts(id),
+                    draft_id TEXT NOT NULL,
+                    action_id TEXT NOT NULL CHECK (action_id IN ('approve_draft', 'reject_draft')),
+                    expected_live INTEGER NOT NULL,
+                    reviewer TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+                    result_draft_id TEXT,
+                    safe_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    claimed_at TEXT,
+                    completed_at TEXT,
+                    FOREIGN KEY (x_account_id, draft_id) REFERENCES drafts(x_account_id, id),
+                    FOREIGN KEY (x_account_id, result_draft_id) REFERENCES drafts(x_account_id, id)
+                );
+
                 CREATE TABLE IF NOT EXISTS publish_attempts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     x_account_id INTEGER NOT NULL REFERENCES x_accounts(id),
@@ -629,6 +648,12 @@ class Database:
                 ON event_log(x_account_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_account_integrations_connection
                 ON account_integrations(connection_id);
+            CREATE INDEX IF NOT EXISTS idx_slack_action_jobs_status_created
+                ON slack_action_jobs(status, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_slack_action_jobs_connection_created
+                ON slack_action_jobs(connection_id, created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_slack_action_jobs_account_created
+                ON slack_action_jobs(x_account_id, created_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_publish_attempts_account_draft
                 ON publish_attempts(x_account_id, draft_id, attempt_number);
             CREATE UNIQUE INDEX IF NOT EXISTS uq_publish_attempts_one_publishing

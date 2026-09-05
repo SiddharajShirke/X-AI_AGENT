@@ -18,6 +18,7 @@ from app.models import (
     PublishAttempt,
     PublishResult,
     ScheduleSlot,
+    SlackActionJob,
     StartupProfile,
     TrendItem,
     XAccount,
@@ -151,6 +152,15 @@ def _binding_from_row(row: Any) -> AccountIntegration:
         ),
         last_test_error=row["last_test_error"],
         last_tested_at=row["last_tested_at"],
+    )
+
+
+def _slack_action_from_row(row: Any) -> SlackActionJob:
+    return SlackActionJob(
+        **{
+            **dict(row),
+            "expected_live": bool(row["expected_live"]),
+        }
     )
 
 
@@ -1161,6 +1171,154 @@ class Repository:
                 (x_account_id, str(provider).strip().lower()),
             ).fetchone()
         return _binding_from_row(row) if row is not None else None
+
+    def enqueue_slack_action(
+        self,
+        *,
+        idempotency_key: str,
+        connection_id: int,
+        x_account_id: int,
+        draft_id: str,
+        action_id: str,
+        expected_live: bool,
+        reviewer: str,
+    ) -> tuple[SlackActionJob, bool]:
+        if action_id not in {"approve_draft", "reject_draft"}:
+            raise ValueError("Unsupported Slack action")
+        with self.database.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO slack_action_jobs (
+                    idempotency_key, connection_id, x_account_id, draft_id,
+                    action_id, expected_live, reviewer, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    idempotency_key,
+                    connection_id,
+                    x_account_id,
+                    str(draft_id),
+                    action_id,
+                    int(expected_live),
+                    reviewer,
+                    utc_now_iso(),
+                ),
+            )
+            created = cursor.rowcount == 1
+            row = conn.execute(
+                "SELECT * FROM slack_action_jobs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return _slack_action_from_row(row), created
+
+    def get_slack_action_job(
+        self, x_account_id: int, job_id: int
+    ) -> SlackActionJob:
+        with self.database.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM slack_action_jobs WHERE x_account_id = ? AND id = ?",
+                (x_account_id, job_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown Slack action job for account {x_account_id}: {job_id}")
+        return _slack_action_from_row(row)
+
+    def latest_slack_action(
+        self, x_account_id: int, connection_id: int
+    ) -> SlackActionJob | None:
+        with self.database.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM slack_action_jobs
+                WHERE x_account_id = ? AND connection_id = ?
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (x_account_id, connection_id),
+            ).fetchone()
+        return _slack_action_from_row(row) if row is not None else None
+
+    def list_slack_actions(
+        self, x_account_id: int, limit: int = 20
+    ) -> list[SlackActionJob]:
+        with self.database.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM slack_action_jobs
+                WHERE x_account_id = ?
+                ORDER BY created_at DESC, id DESC LIMIT ?
+                """,
+                (x_account_id, limit),
+            ).fetchall()
+        return [_slack_action_from_row(row) for row in rows]
+
+    def claim_next_slack_action(self, stale_before: str) -> SlackActionJob | None:
+        claimed_at = utc_now_iso()
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            candidate = conn.execute(
+                """
+                SELECT * FROM slack_action_jobs
+                WHERE status = 'pending'
+                   OR (status = 'processing' AND claimed_at < ?)
+                ORDER BY created_at, id
+                LIMIT 1
+                """,
+                (stale_before,),
+            ).fetchone()
+            if candidate is None:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE slack_action_jobs
+                SET status = 'processing', claimed_at = ?
+                WHERE id = ?
+                  AND (status = 'pending' OR (status = 'processing' AND claimed_at < ?))
+                """,
+                (claimed_at, candidate["id"], stale_before),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM slack_action_jobs WHERE id = ?", (candidate["id"],)
+            ).fetchone()
+        return _slack_action_from_row(row)
+
+    def complete_slack_action(
+        self,
+        x_account_id: int,
+        job_id: int,
+        *,
+        result_draft_id: str,
+    ) -> SlackActionJob:
+        with self.database.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE slack_action_jobs
+                SET status = 'completed', result_draft_id = ?, safe_error = '',
+                    completed_at = ?
+                WHERE x_account_id = ? AND id = ? AND status = 'processing'
+                """,
+                (str(result_draft_id), utc_now_iso(), x_account_id, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Slack action job is not processing: {job_id}")
+        return self.get_slack_action_job(x_account_id, job_id)
+
+    def fail_slack_action(
+        self, x_account_id: int, job_id: int, safe_error: str
+    ) -> SlackActionJob:
+        with self.database.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE slack_action_jobs
+                SET status = 'failed', safe_error = ?, completed_at = ?
+                WHERE x_account_id = ? AND id = ? AND status = 'processing'
+                """,
+                (str(safe_error), utc_now_iso(), x_account_id, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Slack action job is not processing: {job_id}")
+        return self.get_slack_action_job(x_account_id, job_id)
 
     def record_integration_test(
         self,

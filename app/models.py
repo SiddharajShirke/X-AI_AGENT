@@ -183,6 +183,23 @@ class AccountIntegration(Model):
     last_tested_at: str | None
 
 
+class SlackActionJob(Model):
+    id: int
+    idempotency_key: str
+    connection_id: int
+    x_account_id: int
+    draft_id: str
+    action_id: str
+    expected_live: bool
+    reviewer: str
+    status: str
+    result_draft_id: str | None = None
+    safe_error: str = ""
+    created_at: str
+    claimed_at: str | None = None
+    completed_at: str | None = None
+
+
 class PublishAttempt(Model):
     id: int
     x_account_id: int
