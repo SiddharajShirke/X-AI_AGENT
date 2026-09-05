@@ -204,6 +204,28 @@ def _make_job_stale(repository, job_id):
         )
 
 
+def _record_slack_status_notifications(services, account):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    services.notifiers.slack_client = httpx.Client(
+        transport=httpx.MockTransport(handler)
+    )
+    connection = services.integrations.save_connection(
+        "slack",
+        "Slack status notifications",
+        {
+            "webhook_url": "https://slack.test/status",
+            "signing_secret": "slack-status-secret",
+        },
+    )
+    services.integrations.bind(account.id, "slack", connection.id, "")
+    return requests
+
+
 def test_processor_recovers_stale_pending_job(settings, repository):
     services, account, _, draft, job, requests = _live_processor_job(
         settings, repository
@@ -241,6 +263,7 @@ def test_processor_recovers_published_job_without_republication(settings, reposi
             external_post_id="already-published",
         ),
     )
+    status_requests = _record_slack_status_notifications(services, account)
 
     processed = services.slack_actions.tick()
 
@@ -249,11 +272,43 @@ def test_processor_recovers_published_job_without_republication(settings, reposi
     assert requests == []
     assert recovered.status == "completed"
     assert recovered.result_draft_id == draft.id
+    assert len(status_requests) == 1
+    assert "Slack approval recovered: draft was already published" in (
+        json.loads(status_requests[0].content.decode())["text"]
+    )
     with repository.database.connection() as conn:
         attempts = conn.execute(
             "SELECT COUNT(*) FROM publish_attempts WHERE draft_id = ?", (draft.id,)
         ).fetchone()[0]
     assert attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "status_message"),
+    [
+        ("failed", "Slack approval recovered: publishing had already failed"),
+        ("blocked", "Slack approval recovered: approval had already been blocked"),
+    ],
+)
+def test_processor_notifies_recovered_approval_terminal_state(
+    settings, repository, terminal_status, status_message
+):
+    services, account, _, draft, job, requests = _live_processor_job(
+        settings, repository
+    )
+    _make_job_stale(repository, job.id)
+    repository.update_draft(account.id, draft.id, status=terminal_status)
+    status_requests = _record_slack_status_notifications(services, account)
+
+    processed = services.slack_actions.tick()
+
+    recovered = repository.get_slack_action_job(account.id, job.id)
+    assert processed == 1
+    assert requests == []
+    assert recovered.status == "completed"
+    assert recovered.result_draft_id == draft.id
+    assert len(status_requests) == 1
+    assert status_message in json.loads(status_requests[0].content.decode())["text"]
 
 
 def test_processor_fails_stale_publishing_job_for_reconciliation(settings, repository):
@@ -268,6 +323,7 @@ def test_processor_fails_stale_publishing_job_for_reconciliation(settings, repos
         origin="slack",
     )
     assert claimed is not None
+    status_requests = _record_slack_status_notifications(services, account)
 
     processed = services.slack_actions.tick()
 
@@ -279,6 +335,8 @@ def test_processor_fails_stale_publishing_job_for_reconciliation(settings, repos
         "Publication was interrupted; operator reconciliation is required"
     )
     assert repository.get_draft(account.id, draft.id).status == "publishing"
+    assert len(status_requests) == 1
+    assert recovered.safe_error in json.loads(status_requests[0].content.decode())["text"]
 
 
 def test_processor_duplicate_callback_creates_one_publication_attempt(
@@ -358,10 +416,110 @@ def test_processor_rejection_regenerates_through_account_scoped_pipeline(
     assert completed.status == "completed"
 
 
+def _stale_rejection_job(settings, repository):
+    def handler(request):
+        raise AssertionError("Rejection recovery must not call Buffer")
+
+    services = _processor_services(settings, repository, handler)
+    account = repository.list_accounts()[0]
+    connection = repository.create_integration_connection(
+        "slack", "Slack rejection recovery", "encrypted"
+    )
+    original = _pending_draft(repository, account.id)
+    job, _ = repository.enqueue_slack_action(
+        idempotency_key="processor-rejection-recovery",
+        connection_id=connection.id,
+        x_account_id=account.id,
+        draft_id=original.id,
+        action_id="reject_draft",
+        expected_live=False,
+        reviewer="slack:U123:reviewer",
+    )
+    _make_job_stale(repository, job.id)
+    return services, account, original, job
+
+
+@pytest.mark.parametrize("interrupted_status", ["rejecting", "rejected"])
+def test_processor_reconciles_interrupted_rejection_without_child(
+    settings, repository, interrupted_status
+):
+    services, account, original, job = _stale_rejection_job(settings, repository)
+    repository.update_draft(account.id, original.id, status=interrupted_status)
+    status_requests = _record_slack_status_notifications(services, account)
+
+    processed = services.slack_actions.tick()
+
+    recovered = repository.get_slack_action_job(account.id, job.id)
+    assert processed == 1
+    assert recovered.status == "failed"
+    assert recovered.safe_error == (
+        "Rejection was interrupted; operator reconciliation is required"
+    )
+    assert recovered.result_draft_id is None
+    assert len(status_requests) == 1
+    assert recovered.safe_error in json.loads(status_requests[0].content.decode())["text"]
+
+
+def test_processor_recovers_rejected_draft_with_generated_child(
+    settings, repository
+):
+    services, account, original, job = _stale_rejection_job(settings, repository)
+    repository.update_draft(account.id, original.id, status="rejected")
+    child = repository.create_draft(
+        account.id,
+        context_id=original.context_id,
+        schedule_id=original.schedule_id,
+        text="A generated replacement after the recovered Slack rejection.",
+        topic="review",
+        source_summary="manual",
+        status="pending",
+        safety_status="safe",
+        similarity_score=0.1,
+        attempt=original.attempt + 1,
+        parent_draft_id=original.id,
+        config_version=repository.current_config_version(account.id),
+        expires_at=None,
+        generator_provider="demo",
+        prompt_snapshot="",
+    )
+    status_requests = _record_slack_status_notifications(services, account)
+
+    processed = services.slack_actions.tick()
+
+    recovered = repository.get_slack_action_job(account.id, job.id)
+    assert processed == 1
+    assert recovered.status == "completed"
+    assert recovered.result_draft_id == child.id
+    assert len(status_requests) == 1
+    assert "Slack rejection recovered: replacement draft is ready for review" in (
+        json.loads(status_requests[0].content.decode())["text"]
+    )
+
+
+def test_processor_notifies_recovered_rejection_needing_guidance(
+    settings, repository
+):
+    services, account, original, job = _stale_rejection_job(settings, repository)
+    repository.update_draft(account.id, original.id, status="needs_guidance")
+    status_requests = _record_slack_status_notifications(services, account)
+
+    processed = services.slack_actions.tick()
+
+    recovered = repository.get_slack_action_job(account.id, job.id)
+    assert processed == 1
+    assert recovered.status == "completed"
+    assert recovered.result_draft_id == original.id
+    assert len(status_requests) == 1
+    assert "Slack rejection recovered: operator guidance is required" in (
+        json.loads(status_requests[0].content.decode())["text"]
+    )
+
+
 def test_processor_does_not_persist_or_log_unexpected_exception_text(
     settings, repository, monkeypatch, caplog
 ):
     services, account, _, _, job, requests = _live_processor_job(settings, repository)
+    status_requests = _record_slack_status_notifications(services, account)
 
     def fail_approval(*args, **kwargs):
         raise RuntimeError("raw-secret-provider-response")
@@ -375,9 +533,86 @@ def test_processor_does_not_persist_or_log_unexpected_exception_text(
     assert requests == []
     assert failed.status == "failed"
     assert failed.safe_error == "Unexpected Slack action processing failure"
+    assert len(status_requests) == 1
+    assert failed.safe_error in json.loads(status_requests[0].content.decode())["text"]
     assert "raw-secret-provider-response" not in caplog.text
     assert "raw-secret-provider-response" not in json.dumps(
         repository.list_events(account.id)
+    )
+
+
+def test_processor_reconciles_unexpected_failure_after_publication_claim(
+    settings, repository, monkeypatch
+):
+    services, account, _, draft, job, requests = _live_processor_job(
+        settings, repository
+    )
+
+    def fail_after_claim(account_id, draft_id, *, reviewer, origin, **kwargs):
+        claimed = repository.claim_publish(
+            account_id,
+            draft_id,
+            reviewer=reviewer,
+            origin=origin,
+        )
+        assert claimed is not None
+        raise RuntimeError("raw-error-after-publication-claim")
+
+    monkeypatch.setattr(services.pipeline, "approve", fail_after_claim)
+
+    processed = services.slack_actions.tick()
+
+    recovered = repository.get_slack_action_job(account.id, job.id)
+    assert processed == 1
+    assert requests == []
+    assert repository.get_draft(account.id, draft.id).status == "publishing"
+    assert recovered.status == "failed"
+    assert recovered.safe_error == (
+        "Publication was interrupted; operator reconciliation is required"
+    )
+
+
+def test_processor_completes_unexpected_failure_after_durable_publication(
+    settings, repository, monkeypatch
+):
+    services, account, _, draft, job, requests = _live_processor_job(
+        settings, repository
+    )
+    status_requests = _record_slack_status_notifications(services, account)
+
+    def fail_after_publish(account_id, draft_id, *, reviewer, origin, **kwargs):
+        claimed = repository.claim_publish(
+            account_id,
+            draft_id,
+            reviewer=reviewer,
+            origin=origin,
+        )
+        assert claimed is not None
+        claimed_draft, attempt = claimed
+        target = services.integrations.resolve_buffer(account_id)
+        result = services.publishers.publish(
+            claimed_draft, repository.get_account(account_id), target
+        )
+        published = repository.complete_publish(
+            account_id, draft_id, attempt.id, result
+        )
+        assert published.status == "published"
+        raise RuntimeError("raw-error-after-durable-publication")
+
+    monkeypatch.setattr(services.pipeline, "approve", fail_after_publish)
+
+    processed = services.slack_actions.tick()
+
+    recovered = repository.get_slack_action_job(account.id, job.id)
+    assert processed == 1
+    assert len(requests) == 1
+    assert repository.get_draft(account.id, draft.id).status == "published"
+    assert recovered.status == "completed"
+    assert recovered.result_draft_id == draft.id
+    assert recovered.safe_error == ""
+    assert len(status_requests) == 1
+    assert "Slack approval recovered: draft was already published" in (
+        json.loads(status_requests[0].content.decode())["text"]
     )
 
 
@@ -451,6 +686,53 @@ def test_processor_wake_during_tick_triggers_next_tick_without_poll_delay(
             await asyncio.wait_for(worker, timeout=0.5)
 
     asyncio.run(run_worker())
+
+
+def test_processor_stop_before_worker_start_does_not_process_pending_job(
+    settings, repository
+):
+    services, account, _, _, job, requests = _live_processor_job(settings, repository)
+    services.slack_actions.stop()
+
+    async def run_stopped_worker():
+        await asyncio.wait_for(services.slack_actions.run_forever(), timeout=0.5)
+
+    asyncio.run(run_stopped_worker())
+
+    assert requests == []
+    assert repository.get_slack_action_job(account.id, job.id).status == "pending"
+
+
+def test_processor_stop_between_jobs_leaves_remaining_job_pending(
+    settings, repository, monkeypatch
+):
+    services, account, slack_connection, _, first_job, requests = _live_processor_job(
+        settings, repository
+    )
+    second_draft = _pending_draft(repository, account.id)
+    second_job, _ = repository.enqueue_slack_action(
+        idempotency_key="processor-stop-second-job",
+        connection_id=slack_connection.id,
+        x_account_id=account.id,
+        draft_id=second_draft.id,
+        action_id="approve_draft",
+        expected_live=True,
+        reviewer="slack:U123:reviewer",
+    )
+    process = services.slack_actions._process
+
+    def process_then_stop(job):
+        process(job)
+        services.slack_actions.stop()
+
+    monkeypatch.setattr(services.slack_actions, "_process", process_then_stop)
+
+    processed = services.slack_actions.tick()
+
+    assert processed == 1
+    assert len(requests) == 1
+    assert repository.get_slack_action_job(account.id, first_job.id).status == "completed"
+    assert repository.get_slack_action_job(account.id, second_job.id).status == "pending"
 
 
 def test_enqueue_slack_action_is_idempotent_and_secret_free(repository):

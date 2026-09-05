@@ -732,6 +732,18 @@ class Repository:
             rows = conn.execute(query, params).fetchall()
         return [_draft_from_row(row) for row in rows]
 
+    def list_child_drafts(self, x_account_id: int, parent_draft_id: str) -> list[Draft]:
+        with self.database.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM drafts
+                WHERE x_account_id = ? AND parent_draft_id = ?
+                ORDER BY created_at, rowid
+                """,
+                (x_account_id, str(parent_draft_id)),
+            ).fetchall()
+        return [_draft_from_row(row) for row in rows]
+
     def pending_expired_before(self, x_account_id: int, now_iso: str) -> list[Draft]:
         with self.database.connection() as conn:
             rows = conn.execute(
