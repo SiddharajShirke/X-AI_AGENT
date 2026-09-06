@@ -24,6 +24,7 @@ def test_live_mode_warns_about_insecure_public_configuration():
 
 def test_demo_defaults_remain_credential_free():
     settings = Settings(
+        _env_file=None,
         app_mode="demo",
         database_path=":memory:",
         scheduler_enabled=False,
