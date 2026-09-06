@@ -751,7 +751,7 @@ class Repository:
             rows = conn.execute(
                 """
                 SELECT * FROM drafts
-                WHERE x_account_id = ? AND status = 'pending'
+                WHERE x_account_id = ? AND status IN ('pending', 'expiring')
                   AND expires_at IS NOT NULL AND expires_at < ?
                 ORDER BY created_at
                 """,
@@ -769,14 +769,20 @@ class Repository:
                 """
                 UPDATE drafts
                 SET status = 'expiring'
-                WHERE x_account_id = ? AND id = ? AND status = 'pending'
+                WHERE x_account_id = ? AND id = ?
                   AND expires_at IS NOT NULL AND expires_at < ?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM slack_action_jobs AS action
-                      WHERE action.x_account_id = ?
-                        AND action.draft_id = ?
-                        AND action.status IN ('pending', 'processing')
-                        AND action.created_at <= drafts.expires_at
+                  AND (
+                      status = 'expiring'
+                      OR (
+                          status = 'pending'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM slack_action_jobs AS action
+                              WHERE action.x_account_id = ?
+                                AND action.draft_id = ?
+                                AND action.status IN ('pending', 'processing')
+                                AND action.created_at <= drafts.expires_at
+                          )
+                      )
                   )
                 """,
                 (

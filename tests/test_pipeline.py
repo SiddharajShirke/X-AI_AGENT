@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from app.db import Database
+from app.repository import Repository
+from app.services.factory import build_services
+
 
 def test_explicit_approval_publishes_draft(pipeline, repository, x_account):
     draft = pipeline.generate_draft(
@@ -56,6 +60,61 @@ def test_timeout_never_publishes_and_regenerates(pipeline, repository, x_account
     assert all(
         item.status != "published" for item in repository.list_drafts(x_account.id)
     )
+
+
+def test_timeout_recovers_committed_expiring_claim_after_restart(
+    settings, pipeline, repository, x_account
+):
+    repository.update_profile(x_account.id, {"max_attempts": 1})
+    draft = pipeline.generate_draft(
+        x_account.id, context_id=repository.list_contexts(x_account.id)[2].id
+    )
+    deadline = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+    cutoff = deadline + timedelta(seconds=1)
+    repository.update_draft(
+        x_account.id,
+        draft.id,
+        expires_at=deadline.isoformat(timespec="seconds"),
+    )
+
+    claimed = repository.claim_draft_for_expiration(
+        x_account.id, draft.id, cutoff.isoformat(timespec="seconds")
+    )
+
+    assert claimed is not None
+    assert claimed.status == "expiring"
+
+    restarted_repository = Repository(Database(repository.database.path))
+    restarted_pipeline = build_services(settings, restarted_repository).pipeline
+
+    assert restarted_pipeline.expire_and_regenerate(
+        cutoff, x_account_id=x_account.id
+    ) == []
+    recovered = restarted_repository.get_draft(x_account.id, draft.id)
+    feedback = restarted_repository.list_feedback(x_account.id)
+    assert recovered.status == "needs_guidance"
+    assert recovered.rejection_reason == "timeout"
+    assert recovered.reviewer_notes == "Approval timeout and attempt limit reached."
+    assert [
+        (item.decision, item.reason, item.reviewer)
+        for item in feedback
+        if item.draft_id == draft.id
+    ] == [("expired", "timeout", "system")]
+    assert restarted_repository.list_child_drafts(x_account.id, draft.id) == []
+
+    assert restarted_pipeline.expire_and_regenerate(
+        cutoff, x_account_id=x_account.id
+    ) == []
+    assert restarted_repository.get_draft(x_account.id, draft.id).status == (
+        "needs_guidance"
+    )
+    assert len(
+        [
+            item
+            for item in restarted_repository.list_feedback(x_account.id)
+            if item.draft_id == draft.id
+        ]
+    ) == 1
 
 
 def test_unsafe_human_edit_is_blocked(pipeline, repository, x_account):
