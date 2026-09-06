@@ -201,6 +201,27 @@ def test_account_workspace_names_publish_destination_and_has_csrf(settings):
         assert 'data-edit-form' in response.text
 
 
+def test_demo_app_mode_displays_buffer_live_capability_and_mismatch(settings):
+    from app.main import create_app
+
+    configured = settings.model_copy(
+        update={"app_mode": "demo", "buffer_live_posting": True}
+    )
+    with TestClient(create_app(settings=configured, start_scheduler=False)) as client:
+        repository = client.app.state.repository
+        account = repository.list_accounts()[0]
+        repository.update_account(account.id, {"live_posting_enabled": True})
+
+        response = client.get(f"/accounts/{account.id}", headers=_auth())
+
+    assert response.status_code == 200
+    assert "APP DEMO" in response.text
+    assert "BUFFER LIVE ENABLED" in response.text
+    assert "Mode mismatch: APP_MODE=demo does not disable Buffer publication" in response.text
+    assert "This account" in response.text
+    assert "LIVE" in response.text
+
+
 def test_failed_retry_keeps_text_in_live_confirmation_scope(settings):
     from app.main import create_app
 
@@ -416,6 +437,69 @@ def test_slack_inbound_action_health_renders_received_and_failed_safely(settings
     assert "raw exception" not in failed_response.text
     assert "slack.test/private" not in failed_response.text
     assert "received-digest-never-rendered" not in failed_response.text
+
+
+def test_account_dashboard_shows_allowlisted_slack_reconciliation_state(settings):
+    from cryptography.fernet import Fernet
+    from app.main import create_app
+
+    configured = settings.model_copy(
+        update={"app_encryption_key": Fernet.generate_key().decode()}
+    )
+    with TestClient(create_app(settings=configured, start_scheduler=False)) as client:
+        repository = client.app.state.repository
+        account = repository.list_accounts()[0]
+        connection = client.app.state.services.integrations.save_connection(
+            "slack",
+            "Team Slack",
+            {
+                "webhook_url": "https://hooks.slack.test/private-value",
+                "signing_secret": "slack-private-secret",
+            },
+        )
+        client.app.state.services.integrations.bind(
+            account.id, "slack", connection.id, "#x-review"
+        )
+        draft = client.app.state.services.pipeline.generate_draft(
+            account.id, context_id=repository.list_contexts(account.id)[0].id
+        )
+        job, _ = repository.enqueue_slack_action(
+            idempotency_key="reconciliation-digest-never-rendered",
+            connection_id=connection.id,
+            x_account_id=account.id,
+            draft_id=draft.id,
+            action_id="approve_draft",
+            expected_live=False,
+            reviewer="slack:reviewer",
+        )
+        claimed = repository.claim_next_slack_action(
+            "2000-01-01T00:00:00+00:00"
+        )
+        assert claimed is not None
+        repository.update_draft(
+            account.id,
+            draft.id,
+            status="publishing",
+            error="raw-provider-failure-marker",
+            post_url="javascript:raw-provider-link",
+        )
+        repository.fail_slack_action(
+            account.id,
+            job.id,
+            "Publication was interrupted; operator reconciliation is required",
+        )
+
+        response = client.get(f"/accounts/{account.id}", headers=_auth())
+
+    assert response.status_code == 200
+    assert "Inbound actions: Failed" in response.text
+    assert "Action: Approve" in response.text
+    assert f"Source draft: {draft.id}" in response.text
+    assert f"Result draft: {draft.id} (Publishing)" in response.text
+    assert "Reconcile the interrupted publication with Buffer/X" in response.text
+    assert "raw-provider-failure-marker" not in response.text
+    assert "javascript:raw-provider-link" not in response.text
+    assert "reconciliation-digest-never-rendered" not in response.text
 
 
 def test_account_without_copy_source_is_immediately_usable(settings):

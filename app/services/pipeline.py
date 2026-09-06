@@ -573,12 +573,8 @@ class Pipeline:
         for account in accounts:
             profile = self.repository.get_profile(account.id)
             for draft in self.repository.pending_expired_before(account.id, cutoff):
-                claimed = self.repository.transition_draft(
-                    account.id,
-                    draft.id,
-                    from_status="pending",
-                    to_status="expiring",
-                    expires_at=None,
+                claimed = self.repository.claim_draft_for_expiration(
+                    account.id, draft.id, cutoff
                 )
                 if claimed is None:
                     continue
@@ -598,7 +594,6 @@ class Pipeline:
                         to_status="needs_guidance",
                         rejection_reason="timeout",
                         reviewer_notes="Approval timeout and attempt limit reached.",
-                        expires_at=None,
                     )
                     continue
                 self.repository.transition_draft(
@@ -608,7 +603,6 @@ class Pipeline:
                     to_status="expired",
                     rejection_reason="timeout",
                     reviewer_notes="No explicit approval received.",
-                    expires_at=None,
                 )
                 replacement = self.generate_draft(
                     account.id,

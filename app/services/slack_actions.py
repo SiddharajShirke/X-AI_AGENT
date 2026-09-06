@@ -23,6 +23,9 @@ _REJECTION_RECONCILIATION_REQUIRED = (
 _PUBLICATION_MODE_CHANGED = "Publication mode changed; request a fresh Slack review"
 _ACCOUNT_PAUSED = "X account is paused"
 _DRAFT_NOT_PENDING = "Draft is no longer pending"
+_ACTION_AFTER_DEADLINE = (
+    "Slack action arrived after the approval deadline; request a fresh review"
+)
 _ACTION_REJECTED = "Slack action could not be processed"
 _APPROVAL_RECOVERED_MESSAGES = {
     "published": "Slack approval recovered: draft was already published",
@@ -79,6 +82,17 @@ class SlackActionProcessor:
     def _process(self, job: SlackActionJob) -> None:
         account = self.repository.get_account(job.x_account_id)
         draft = self.repository.get_draft(job.x_account_id, job.draft_id)
+        if (
+            draft.expires_at is not None
+            and job.created_at > draft.expires_at
+        ):
+            self.repository.fail_slack_action(
+                job.x_account_id,
+                job.id,
+                _ACTION_AFTER_DEADLINE,
+            )
+            self._notify_status(job, draft, account, _ACTION_AFTER_DEADLINE)
+            return
         if self._settle_recovered_state(job, account, draft):
             return
         try:
@@ -104,6 +118,26 @@ class SlackActionProcessor:
                 job.id,
                 result_draft_id=result.id if result is not None else job.draft_id,
             )
+            if job.action_id == "approve_draft" and result is not None:
+                if result.status == "blocked":
+                    self._notify_status(
+                        job,
+                        result,
+                        account,
+                        "Slack approval was blocked by the safety check; "
+                        "review this account's blocked draft",
+                    )
+            elif job.action_id == "reject_draft" and result is None:
+                guidance = self.repository.get_draft(
+                    job.x_account_id, job.draft_id
+                )
+                if guidance.status == "needs_guidance":
+                    self._notify_status(
+                        job,
+                        guidance,
+                        account,
+                        "Slack rejection completed; operator guidance is required",
+                    )
         except PipelineError as exc:
             safe_error = self._normalize_pipeline_error(exc)
             self.repository.fail_slack_action(job.x_account_id, job.id, safe_error)

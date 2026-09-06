@@ -264,6 +264,196 @@ def test_valid_slack_approval_is_queued_for_processing(settings):
         assert jobs[0].status == "pending"
 
 
+def test_slack_callback_persists_only_the_validated_user_identifier(settings):
+    from app.main import create_app
+
+    app = create_app(
+        settings=_configured_settings(settings),
+        start_scheduler=False,
+        start_slack_worker=False,
+    )
+    with TestClient(app) as client:
+        account = app.state.repository.list_accounts()[0]
+        connection = _connect_slack(app, account.id)
+        draft = _pending(app, account.id)
+        raw_name_marker = "raw-slack-profile-marker"
+        payload = _slack_payload("approve_draft", account.id, draft.id)
+        payload["user"]["name"] = raw_name_marker
+        body, headers = _signed_request(payload, "signing-secret")
+
+        response = client.post(
+            f"/integrations/slack/{connection.id}/actions",
+            content=body,
+            headers=headers,
+        )
+        jobs = app.state.repository.list_slack_actions(account.id)
+
+    assert response.status_code == 200
+    assert jobs[0].reviewer == "slack:U123"
+    persisted = json.dumps(
+        {
+            "jobs": [job.model_dump() for job in jobs],
+            "events": app.state.repository.list_events(account.id),
+        },
+        default=str,
+    )
+    assert raw_name_marker not in persisted
+
+
+def test_slack_callback_rejects_an_invalid_user_identifier(settings):
+    from app.main import create_app
+
+    app = create_app(
+        settings=_configured_settings(settings),
+        start_scheduler=False,
+        start_slack_worker=False,
+    )
+    with TestClient(app) as client:
+        account = app.state.repository.list_accounts()[0]
+        connection = _connect_slack(app, account.id)
+        draft = _pending(app, account.id)
+        payload = _slack_payload("approve_draft", account.id, draft.id)
+        payload["user"]["id"] = "U123\ninvalid"
+        body, headers = _signed_request(payload, "signing-secret")
+
+        response = client.post(
+            f"/integrations/slack/{connection.id}/actions",
+            content=body,
+            headers=headers,
+        )
+
+    assert response.status_code == 400
+    assert app.state.repository.list_slack_actions(account.id) == []
+
+
+def test_received_audit_commits_before_worker_can_process_callback(
+    settings, monkeypatch
+):
+    from app.main import create_app
+
+    app = create_app(
+        settings=_configured_settings(settings),
+        start_scheduler=False,
+        start_slack_worker=False,
+    )
+    with TestClient(app) as client:
+        account = app.state.repository.list_accounts()[0]
+        connection = _connect_slack(app, account.id)
+        draft = _pending(app, account.id)
+        original_enqueue = app.state.repository.enqueue_slack_action
+
+        def enqueue_then_run_worker(**kwargs):
+            result = original_enqueue(**kwargs)
+            assert app.state.services.slack_actions.tick() == 1
+            return result
+
+        monkeypatch.setattr(
+            app.state.repository,
+            "enqueue_slack_action",
+            enqueue_then_run_worker,
+        )
+        body, headers = _signed_request(
+            _slack_payload("approve_draft", account.id, draft.id),
+            "signing-secret",
+        )
+
+        response = client.post(
+            f"/integrations/slack/{connection.id}/actions",
+            content=body,
+            headers=headers,
+        )
+
+        events = [
+            event["event_type"]
+            for event in reversed(app.state.repository.list_events(account.id))
+            if event["event_type"].startswith("slack_action_")
+        ]
+
+    assert response.status_code == 200
+    assert events == [
+        "slack_action_received",
+        "slack_action_processing",
+        "slack_action_completed",
+    ]
+
+
+def test_received_audit_failure_rolls_back_callback_acceptance(settings):
+    from app.main import create_app
+
+    app = create_app(
+        settings=_configured_settings(settings),
+        start_scheduler=False,
+        start_slack_worker=False,
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        account = app.state.repository.list_accounts()[0]
+        connection = _connect_slack(app, account.id)
+        draft = _pending(app, account.id)
+        with app.state.repository.database.connection() as conn:
+            conn.executescript(
+                """
+                CREATE TRIGGER fail_received_audit
+                BEFORE INSERT ON event_log
+                WHEN NEW.event_type = 'slack_action_received'
+                BEGIN
+                    SELECT RAISE(ABORT, 'received audit unavailable');
+                END;
+                """
+            )
+        body, headers = _signed_request(
+            _slack_payload("approve_draft", account.id, draft.id),
+            "signing-secret",
+        )
+
+        response = client.post(
+            f"/integrations/slack/{connection.id}/actions",
+            content=body,
+            headers=headers,
+        )
+
+    assert response.status_code == 500
+    assert app.state.repository.list_slack_actions(account.id) == []
+
+
+def test_duplicate_audit_failure_does_not_reject_an_accepted_callback(settings):
+    from app.main import create_app
+
+    app = create_app(
+        settings=_configured_settings(settings),
+        start_scheduler=False,
+        start_slack_worker=False,
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        account = app.state.repository.list_accounts()[0]
+        connection = _connect_slack(app, account.id)
+        draft = _pending(app, account.id)
+        body, headers = _signed_request(
+            _slack_payload("approve_draft", account.id, draft.id),
+            "signing-secret",
+        )
+        url = f"/integrations/slack/{connection.id}/actions"
+        first = client.post(url, content=body, headers=headers)
+        with app.state.repository.database.connection() as conn:
+            conn.executescript(
+                """
+                CREATE TRIGGER fail_duplicate_audit
+                BEFORE INSERT ON event_log
+                WHEN NEW.event_type = 'slack_action_duplicate'
+                BEGIN
+                    SELECT RAISE(ABORT, 'duplicate audit unavailable');
+                END;
+                """
+            )
+
+        duplicate = client.post(url, content=body, headers=headers)
+        jobs = app.state.repository.list_slack_actions(account.id)
+
+    assert first.status_code == 200
+    assert duplicate.status_code == 200
+    assert duplicate.json()["job_id"] == jobs[0].id
+    assert len(jobs) == 1
+
+
 def test_slack_approval_is_queued_when_publication_mode_changes(settings):
     from app.main import create_app
 
@@ -452,11 +642,15 @@ def test_duplicate_slack_delivery_returns_the_same_queued_job(settings):
 
         first = client.post(url, content=body, headers=headers)
         second = client.post(url, content=body, headers=headers)
+        jobs = app.state.repository.list_slack_actions(account.id)
 
         assert first.status_code == 200
         assert second.status_code == 200
+        assert first.json()["job_id"] is not None
+        assert second.json()["job_id"] is not None
         assert first.json()["job_id"] == second.json()["job_id"]
-        assert len(app.state.repository.list_slack_actions(account.id)) == 1
+        assert len(jobs) == 1
+        assert first.json()["job_id"] == jobs[0].id
 
 
 def test_slack_reject_requires_an_explicit_publication_mode(settings):

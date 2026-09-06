@@ -354,6 +354,31 @@ def test_buffer_publisher_null_external_link_does_not_create_fake_url(repository
     assert "buffer.com" not in (result.post_url or "")
 
 
+def test_buffer_publisher_drops_an_untrusted_external_link(repository):
+    """Provider-controlled links must be validated before they can be persisted."""
+    from app.services.publishers import BufferPublisher
+
+    settings = _buffer_settings()
+    draft = _make_draft(repository)
+    response_body = _buffer_success_response(
+        post_id="bufunsafe",
+        external_link="javascript:raw-provider-link",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=response_body, request=request)
+
+    result = BufferPublisher(
+        settings,
+        _buffer_target(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    ).publish(draft)
+
+    assert result.success is True
+    assert result.post_url == ""
+    assert "raw-provider-link" not in result.model_dump_json()
+
+
 def test_buffer_publisher_typed_mutation_error_returns_failure(repository):
     """A MutationError __typename must result in success=False."""
     from app.services.publishers import BufferPublisher
@@ -396,6 +421,31 @@ def test_buffer_publisher_top_level_graphql_errors_return_failure(repository):
 
     assert result.success is False
     assert result.provider == "buffer"
+
+
+def test_buffer_publisher_never_returns_raw_provider_error_text(repository):
+    """Provider error bodies can contain secrets and are not normalized output."""
+    from app.services.publishers import BufferPublisher
+
+    settings = _buffer_settings()
+    draft = _make_draft(repository)
+    raw_marker = "raw-provider-secret-marker"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"errors": [{"message": raw_marker}]},
+            request=request,
+        )
+
+    result = BufferPublisher(
+        settings,
+        _buffer_target(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    ).publish(draft)
+
+    assert result.success is False
+    assert raw_marker not in result.model_dump_json()
 
 
 def test_buffer_publisher_http_failure_returns_failure(repository):

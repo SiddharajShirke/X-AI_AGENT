@@ -8,6 +8,7 @@ import httpx
 
 from app.config import Settings
 from app.models import ContentContext, Draft, NotificationResult, StartupProfile, XAccount
+from app.safe_display import validated_public_url
 from app.services.integrations import IntegrationError, IntegrationService
 
 logger = logging.getLogger(__name__)
@@ -220,10 +221,21 @@ class SlackNotifier:
             )
 
     def notify_status(self, draft: Draft, account: XAccount, message: str) -> NotificationResult:
+        post_url = (
+            validated_public_url(draft.post_url)
+            if draft.status == "published"
+            else ""
+        )
+        url_suffix = f"\nPost: {post_url}" if post_url else ""
         try:
             response = self.client.post(
                 self.webhook_url,
-                json={"text": f"@{account.handle}: {message} — draft {draft.id}"},
+                json={
+                    "text": (
+                        f"@{account.handle}: {message} — draft {draft.id}"
+                        f"{url_suffix}"
+                    )
+                },
             )
             response.raise_for_status()
             return NotificationResult(success=True, provider="slack")

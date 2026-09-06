@@ -8,8 +8,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from app.dependencies import get_pipeline, get_repository, require_admin
-from app.models import AccountIntegration, SlackActionJob
+from app.models import AccountIntegration, Draft, SlackActionJob
 from app.repository import Repository
+from app.safe_display import validated_public_url
 from app.services.integrations import IntegrationError
 from app.services.pipeline import Pipeline, PipelineError
 
@@ -37,7 +38,79 @@ def _form_error(exc: Exception) -> None:
     raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
-def _slack_inbound_health(action: SlackActionJob | None) -> dict[str, str]:
+_SLACK_ACTION_LABELS = {
+    "approve_draft": "Approve",
+    "reject_draft": "Reject",
+}
+_DRAFT_STATUS_LABELS = {
+    "pending": "Pending",
+    "publishing": "Publishing",
+    "published": "Published",
+    "failed": "Failed",
+    "blocked": "Blocked",
+    "rejecting": "Rejecting",
+    "rejected": "Rejected",
+    "editing": "Editing",
+    "expiring": "Expiring",
+    "expired": "Expired",
+    "needs_guidance": "Needs guidance",
+}
+_FAILED_ACTION_GUIDANCE = {
+    "Publication was interrupted; operator reconciliation is required": (
+        "Reconcile the interrupted publication with Buffer/X before any new "
+        "explicit action."
+    ),
+    "Rejection was interrupted; operator reconciliation is required": (
+        "Review the original and child drafts before taking another explicit action."
+    ),
+    "Publication mode changed; request a fresh Slack review": (
+        "Generate a fresh Slack review message and confirm its displayed mode."
+    ),
+    "Slack action arrived after the approval deadline; request a fresh review": (
+        "Use the current replacement draft or generate a fresh review."
+    ),
+    "X account is paused": "Re-enable this account before requesting a fresh review.",
+    "Draft is no longer pending": (
+        "Review this account's current draft state before taking another action."
+    ),
+    "Unexpected Slack action processing failure": (
+        "Inspect this account's safe audit state before taking another explicit action."
+    ),
+    "Slack action could not be processed": (
+        "Review this account's current state and request a fresh Slack review."
+    ),
+}
+
+
+def _terminal_guidance(action: SlackActionJob, result: Draft | None) -> str:
+    if action.status == "failed":
+        return _FAILED_ACTION_GUIDANCE.get(
+            action.safe_error,
+            "Review this account's safe action state before taking another explicit action.",
+        )
+    if result is None:
+        return "Review this account's current draft state before taking another action."
+    return {
+        "published": "Publication completed; open the validated post link when available.",
+        "failed": "Resolve the Buffer connection, then use the explicit Retry control.",
+        "blocked": "Review the blocked draft and this account's safety configuration.",
+        "needs_guidance": "Add operator guidance before generating another replacement.",
+        "pending": "Review the replacement draft before making a new explicit decision.",
+        "publishing": (
+            "Reconcile the interrupted publication with Buffer/X before any new "
+            "explicit action."
+        ),
+        "expired": "Use the current replacement draft or generate a fresh review.",
+        "rejected": "Review this account's replacement history before continuing.",
+    }.get(
+        result.status,
+        "Review this account's current draft state before taking another action.",
+    )
+
+
+def _slack_inbound_health(
+    action: SlackActionJob | None, result: Draft | None = None
+) -> dict[str, str]:
     if action is None:
         return {
             "state": "Not verified",
@@ -46,27 +119,34 @@ def _slack_inbound_health(action: SlackActionJob | None) -> dict[str, str]:
                 "Check the Slack app settings, then use an action from a Slack review."
             ),
         }
-    if action.status == "completed":
-        return {
-            "state": "Completed",
-            "details": (
-                f"Completed {action.completed_at or action.created_at}. "
-                "The inbound Slack action was applied to this account's review workflow."
-            ),
-        }
-    if action.status == "failed":
-        return {
-            "state": "Failed",
-            "details": (
-                f"Failed {action.completed_at or action.created_at}. "
-                "Review this account's draft state, then retry the action from Slack."
-            ),
-        }
+    state = {
+        "completed": "Completed",
+        "failed": "Failed",
+        "pending": "Received",
+        "processing": "Received",
+    }.get(action.status, "Received")
+    action_label = _SLACK_ACTION_LABELS.get(action.action_id, "Unknown")
+    result_id = action.result_draft_id or action.draft_id
+    result_status = (
+        _DRAFT_STATUS_LABELS.get(result.status, "Unavailable")
+        if result is not None
+        else "Unavailable"
+    )
+    timestamp = (
+        action.completed_at
+        if state in {"Completed", "Failed"} and action.completed_at
+        else action.created_at
+    )
+    if state == "Received":
+        guidance = "The authenticated action is awaiting processing; refresh shortly."
+    else:
+        guidance = _terminal_guidance(action, result)
     return {
-        "state": "Received",
+        "state": state,
         "details": (
-            f"Received {action.created_at}. "
-            "The inbound Slack action is awaiting processing; refresh shortly."
+            f"{state} {timestamp}. Action: {action_label}. "
+            f"Source draft: {action.draft_id}. "
+            f"Result draft: {result_id} ({result_status}). {guidance}"
         ),
     }
 
@@ -112,12 +192,24 @@ def _slack_connection_context(
         item.id: repository.latest_slack_action(x_account_id, item.id)
         for item in slack_connections
     }
+    latest_slack_results: dict[int, Draft | None] = {}
+    for connection_id, action in latest_slack_actions.items():
+        result = None
+        if action is not None:
+            result_id = action.result_draft_id or action.draft_id
+            try:
+                result = repository.get_draft(x_account_id, result_id)
+            except KeyError:
+                result = None
+        latest_slack_results[connection_id] = result
     return {
         "slack_connections": slack_connections,
         "slack_callback_urls": slack_callback_urls,
         "latest_slack_actions": latest_slack_actions,
         "slack_inbound_health": {
-            connection_id: _slack_inbound_health(action)
+            connection_id: _slack_inbound_health(
+                action, latest_slack_results[connection_id]
+            )
             for connection_id, action in latest_slack_actions.items()
         },
         "slack_outbound_healths": {
@@ -154,6 +246,9 @@ def _dashboard_context(request: Request, repository: Repository, x_account_id: i
         "context_map": context_map,
         "schedules": schedules,
         "drafts": drafts,
+        "safe_post_urls": {
+            draft.id: validated_public_url(draft.post_url) for draft in drafts
+        },
         "pending": [draft for draft in drafts if draft.status == "pending"],
         "published": [draft for draft in drafts if draft.status == "published"],
         "rejected": [

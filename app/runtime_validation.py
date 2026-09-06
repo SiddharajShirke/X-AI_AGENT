@@ -3,10 +3,15 @@ from app.config import Settings
 
 def deployment_warnings(settings: Settings) -> list[str]:
     """Return safe-to-log operator warnings for a live deployment."""
-    if settings.demo_mode:
+    if settings.demo_mode and not settings.buffer_live_posting:
         return []
 
     warnings: list[str] = []
+    if settings.demo_mode and settings.buffer_live_posting:
+        warnings.append(
+            "APP_MODE=demo does not disable publication while "
+            "BUFFER_LIVE_POSTING=true"
+        )
     if not settings.base_url.lower().startswith("https://"):
         warnings.append("BASE_URL must use stable HTTPS for Slack callbacks")
     if settings.admin_password == "change-me":

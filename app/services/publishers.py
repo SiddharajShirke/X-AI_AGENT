@@ -6,6 +6,7 @@ import httpx
 
 from app.config import Settings
 from app.models import Draft, PublishResult, XAccount
+from app.safe_display import validated_public_url
 from app.services.integrations import BufferTarget
 
 logger = logging.getLogger(__name__)
@@ -128,11 +129,10 @@ class BufferPublisher:
 
         # Check for top-level GraphQL errors
         if body.get("errors"):
-            messages = "; ".join(e.get("message", "unknown") for e in body["errors"])
             return PublishResult(
                 success=False,
                 provider="buffer",
-                error=f"GraphQL errors: {messages}",
+                error="Buffer API reported a GraphQL error",
             )
 
         # Navigate into the typed response
@@ -147,18 +147,17 @@ class BufferPublisher:
         typename = create_post.get("__typename")
 
         if typename == "MutationError":
-            message = create_post.get("message") or "Buffer refused the post"
             return PublishResult(
                 success=False,
                 provider="buffer",
-                error=f"Buffer MutationError: {message}",
+                error="Buffer rejected the post",
             )
 
         if typename != "PostActionSuccess":
             return PublishResult(
                 success=False,
                 provider="buffer",
-                error=f"Unexpected Buffer response type: {typename!r}",
+                error="Buffer returned an unexpected response type",
             )
 
         post = create_post.get("post")
@@ -179,7 +178,7 @@ class BufferPublisher:
 
         # externalLink may be null while Buffer is still processing.
         # Do not fabricate a URL.
-        external_link: str = post.get("externalLink") or ""
+        external_link = validated_public_url(post.get("externalLink"))
 
         # Sanitize the raw response before storing: exclude auth headers,
         # keep only the post object which contains no secrets.

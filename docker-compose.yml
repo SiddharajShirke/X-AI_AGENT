@@ -4,6 +4,8 @@ services:
     container_name: startup-x-agent-prototype
     env_file:
       - .env
+    environment:
+      DATABASE_PATH: /data/x_agent.db
     ports:
       - "8000:8000"
     volumes:

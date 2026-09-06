@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from threading import Barrier, Event
 
 import httpx
@@ -100,6 +101,7 @@ def test_processor_approval_publishes_through_account_scoped_pipeline(
         expected_live=True,
         reviewer="slack:U123:reviewer",
     )
+    status_requests = _record_slack_status_notifications(services, account)
     processor = SlackActionProcessor(
         services.pipeline.settings,
         repository,
@@ -115,8 +117,11 @@ def test_processor_approval_publishes_through_account_scoped_pipeline(
     assert len(requests) == 1
     assert draft.status == "published"
     assert draft.publisher_provider == "buffer"
+    assert draft.post_url == "https://buffer.test/post/1"
     assert job.status == "completed"
     assert job.result_draft_id == draft.id
+    assert len(status_requests) == 1
+    assert draft.post_url in json.loads(status_requests[0].content.decode())["text"]
     with repository.database.connection() as conn:
         attempt = conn.execute(
             "SELECT origin, reviewer FROM publish_attempts WHERE draft_id = ?",
@@ -132,6 +137,7 @@ def test_processor_approval_publishes_through_account_scoped_pipeline(
         if event["event_type"].startswith("slack_action_")
     ]
     assert [event["event_type"] for event in slack_events] == [
+        "slack_action_received",
         "slack_action_processing",
         "slack_action_completed",
     ]
@@ -238,6 +244,216 @@ def test_processor_recovers_stale_pending_job(settings, repository):
     assert len(requests) == 1
     assert repository.get_draft(account.id, draft.id).status == "published"
     assert repository.get_slack_action_job(account.id, job.id).status == "completed"
+
+
+def test_timely_action_accepted_while_timeout_is_scanning_protects_draft(
+    settings, repository, monkeypatch
+):
+    services = build_services(settings, repository)
+    account = repository.list_accounts()[0]
+    draft = _pending_draft(repository, account.id)
+    deadline = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+    repository.update_draft(
+        account.id,
+        draft.id,
+        expires_at=deadline.isoformat(timespec="seconds"),
+    )
+    connection = repository.create_integration_connection(
+        "slack", "Deadline race", "encrypted"
+    )
+    scan_finished = Event()
+    release_timeout = Event()
+    original_scan = repository.pending_expired_before
+
+    def paused_scan(account_id, cutoff):
+        candidates = original_scan(account_id, cutoff)
+        scan_finished.set()
+        assert release_timeout.wait(timeout=2)
+        return candidates
+
+    monkeypatch.setattr(repository, "pending_expired_before", paused_scan)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        timeout = executor.submit(
+            services.pipeline.expire_and_regenerate,
+            deadline + timedelta(seconds=1),
+            account.id,
+        )
+        assert scan_finished.wait(timeout=2)
+        monkeypatch.setattr(
+            "app.repository.utc_now_iso",
+            lambda: (deadline - timedelta(seconds=1)).isoformat(timespec="seconds"),
+        )
+        job, _ = repository.enqueue_slack_action(
+            idempotency_key="timely-timeout-race",
+            connection_id=connection.id,
+            x_account_id=account.id,
+            draft_id=draft.id,
+            action_id="approve_draft",
+            expected_live=False,
+            reviewer="slack:U123:reviewer",
+        )
+        release_timeout.set()
+        replacements = timeout.result(timeout=2)
+
+    assert replacements == []
+    assert repository.get_draft(account.id, draft.id).status == "pending"
+    assert services.slack_actions.tick() == 1
+    assert repository.get_draft(account.id, draft.id).status == "published"
+    assert repository.get_slack_action_job(account.id, job.id).status == "completed"
+
+
+def test_action_accepted_at_deadline_survives_restart_and_timeout(
+    settings, repository, monkeypatch
+):
+    account = repository.list_accounts()[0]
+    draft = _pending_draft(repository, account.id)
+    deadline = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+    repository.update_draft(
+        account.id,
+        draft.id,
+        expires_at=deadline.isoformat(timespec="seconds"),
+    )
+    connection = repository.create_integration_connection(
+        "slack", "Deadline restart", "encrypted"
+    )
+    monkeypatch.setattr(
+        "app.repository.utc_now_iso",
+        lambda: deadline.isoformat(timespec="seconds"),
+    )
+    job, _ = repository.enqueue_slack_action(
+        idempotency_key="deadline-restart",
+        connection_id=connection.id,
+        x_account_id=account.id,
+        draft_id=draft.id,
+        action_id="approve_draft",
+        expected_live=False,
+        reviewer="slack:U123:reviewer",
+    )
+
+    restarted_repository = Repository(Database(repository.database.path))
+    restarted_services = build_services(settings, restarted_repository)
+    replacements = restarted_services.pipeline.expire_and_regenerate(
+        deadline + timedelta(minutes=1), x_account_id=account.id
+    )
+
+    assert replacements == []
+    assert restarted_repository.get_draft(account.id, draft.id).status == "pending"
+    assert restarted_services.slack_actions.tick() == 1
+    assert restarted_repository.get_draft(account.id, draft.id).status == "published"
+    assert (
+        restarted_repository.get_slack_action_job(account.id, job.id).status
+        == "completed"
+    )
+
+
+@pytest.mark.parametrize("task_order", ["worker_first", "timeout_first"])
+def test_action_accepted_after_deadline_never_publishes_in_either_task_order(
+    settings, repository, monkeypatch, task_order
+):
+    services = build_services(settings, repository)
+    account = repository.list_accounts()[0]
+    draft = _pending_draft(repository, account.id)
+    deadline = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+    repository.update_draft(
+        account.id,
+        draft.id,
+        expires_at=deadline.isoformat(timespec="seconds"),
+    )
+    connection = repository.create_integration_connection(
+        "slack", "Late action", "encrypted"
+    )
+    monkeypatch.setattr(
+        "app.repository.utc_now_iso",
+        lambda: (deadline + timedelta(seconds=1)).isoformat(timespec="seconds"),
+    )
+    job, _ = repository.enqueue_slack_action(
+        idempotency_key=f"late-action-{task_order}",
+        connection_id=connection.id,
+        x_account_id=account.id,
+        draft_id=draft.id,
+        action_id="approve_draft",
+        expected_live=False,
+        reviewer="slack:U123:reviewer",
+    )
+    timeout_at = deadline + timedelta(seconds=2)
+
+    if task_order == "worker_first":
+        assert services.slack_actions.tick() == 1
+        services.pipeline.expire_and_regenerate(timeout_at, x_account_id=account.id)
+    else:
+        services.pipeline.expire_and_regenerate(timeout_at, x_account_id=account.id)
+        assert services.slack_actions.tick() == 1
+
+    settled = repository.get_slack_action_job(account.id, job.id)
+    with repository.database.connection() as conn:
+        publish_attempts = conn.execute(
+            "SELECT COUNT(*) FROM publish_attempts WHERE draft_id = ?",
+            (draft.id,),
+        ).fetchone()[0]
+
+    assert settled.status == "failed"
+    assert publish_attempts == 0
+    assert repository.get_draft(account.id, draft.id).status in {
+        "expired",
+        "needs_guidance",
+    }
+    assert all(
+        item.status != "published" for item in repository.list_drafts(account.id)
+    )
+
+
+def test_late_rejection_fails_when_timeout_reaches_guidance_first(
+    settings, repository, monkeypatch
+):
+    services = build_services(settings, repository)
+    account = repository.list_accounts()[0]
+    repository.update_profile(account.id, {"max_attempts": 1})
+    draft = _pending_draft(repository, account.id)
+    deadline = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
+    repository.update_draft(
+        account.id,
+        draft.id,
+        expires_at=deadline.isoformat(timespec="seconds"),
+    )
+    connection = repository.create_integration_connection(
+        "slack", "Late rejection", "encrypted"
+    )
+    monkeypatch.setattr(
+        "app.repository.utc_now_iso",
+        lambda: (deadline + timedelta(seconds=1)).isoformat(timespec="seconds"),
+    )
+    job, _ = repository.enqueue_slack_action(
+        idempotency_key="late-rejection-timeout-first",
+        connection_id=connection.id,
+        x_account_id=account.id,
+        draft_id=draft.id,
+        action_id="reject_draft",
+        expected_live=False,
+        reviewer="slack:U123:reviewer",
+    )
+
+    replacements = services.pipeline.expire_and_regenerate(
+        deadline + timedelta(seconds=2), x_account_id=account.id
+    )
+    assert replacements == []
+    timed_out = repository.get_draft(account.id, draft.id)
+    assert timed_out.status == "needs_guidance"
+    assert timed_out.rejection_reason == "timeout"
+    assert timed_out.expires_at == deadline.isoformat(timespec="seconds")
+
+    assert services.slack_actions.tick() == 1
+
+    settled = repository.get_slack_action_job(account.id, job.id)
+    assert settled.status == "failed"
+    assert settled.safe_error == (
+        "Slack action arrived after the approval deadline; request a fresh review"
+    )
+    assert repository.list_child_drafts(account.id, draft.id) == []
+    with repository.database.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM publish_attempts WHERE draft_id = ?",
+            (draft.id,),
+        ).fetchone()[0] == 0
 
 
 def test_processor_recovers_published_job_without_republication(settings, repository):
@@ -372,6 +588,7 @@ def test_processor_normalizes_publication_mode_error(settings, repository):
     services, account, _, _, job, requests = _live_processor_job(
         settings, repository, expected_live=False
     )
+    status_requests = _record_slack_status_notifications(services, account)
 
     processed = services.slack_actions.tick()
 
@@ -380,6 +597,85 @@ def test_processor_normalizes_publication_mode_error(settings, repository):
     assert requests == []
     assert failed.status == "failed"
     assert failed.safe_error == "Publication mode changed; request a fresh Slack review"
+    assert len(status_requests) == 1
+    status_text = json.loads(status_requests[0].content.decode())["text"]
+    assert failed.safe_error in status_text
+
+
+def test_processor_notifies_when_fresh_safety_check_blocks_approval(
+    settings, repository
+):
+    def handler(request):
+        raise AssertionError("A safety-blocked approval must not call Buffer")
+
+    services = _processor_services(settings, repository, handler)
+    account = repository.list_accounts()[0]
+    draft = _pending_draft(repository, account.id)
+    repository.update_profile(
+        account.id,
+        {"never_reveal": ["pending post for explicit Slack review"]},
+    )
+    connection = repository.create_integration_connection(
+        "slack", "Fresh safety check", "encrypted"
+    )
+    job, _ = repository.enqueue_slack_action(
+        idempotency_key="fresh-safety-block",
+        connection_id=connection.id,
+        x_account_id=account.id,
+        draft_id=draft.id,
+        action_id="approve_draft",
+        expected_live=False,
+        reviewer="slack:U123:reviewer",
+    )
+    status_requests = _record_slack_status_notifications(services, account)
+
+    assert services.slack_actions.tick() == 1
+
+    blocked = repository.get_draft(account.id, draft.id)
+    completed = repository.get_slack_action_job(account.id, job.id)
+    assert blocked.status == "blocked"
+    assert completed.status == "completed"
+    assert len(status_requests) == 1
+    status_text = json.loads(status_requests[0].content.decode())["text"]
+    assert "blocked by the safety check" in status_text
+    assert "pending post for explicit Slack review" not in status_text
+
+
+def test_processor_notifies_when_rejection_reaches_regeneration_limit(
+    settings, repository
+):
+    def handler(request):
+        raise AssertionError("A rejection must not call Buffer")
+
+    services = _processor_services(settings, repository, handler)
+    account = repository.list_accounts()[0]
+    repository.update_profile(account.id, {"max_attempts": 1})
+    draft = _pending_draft(repository, account.id)
+    connection = repository.create_integration_connection(
+        "slack", "Regeneration limit", "encrypted"
+    )
+    job, _ = repository.enqueue_slack_action(
+        idempotency_key="rejection-guidance",
+        connection_id=connection.id,
+        x_account_id=account.id,
+        draft_id=draft.id,
+        action_id="reject_draft",
+        expected_live=False,
+        reviewer="slack:U123:reviewer",
+    )
+    status_requests = _record_slack_status_notifications(services, account)
+
+    assert services.slack_actions.tick() == 1
+
+    guidance = repository.get_draft(account.id, draft.id)
+    completed = repository.get_slack_action_job(account.id, job.id)
+    assert guidance.status == "needs_guidance"
+    assert completed.status == "completed"
+    assert completed.result_draft_id == draft.id
+    assert len(status_requests) == 1
+    assert "operator guidance is required" in (
+        json.loads(status_requests[0].content.decode())["text"]
+    )
 
 
 def test_processor_rejection_regenerates_through_account_scoped_pipeline(

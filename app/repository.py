@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import uuid
@@ -38,6 +39,7 @@ _LIST_COLUMNS = {
 }
 _ACCOUNT_UPDATE_FIELDS = {"name", "handle", "enabled", "live_posting_enabled", "timezone"}
 _HANDLE_PATTERN = re.compile(r"[a-z0-9_]{1,15}")
+logger = logging.getLogger(__name__)
 
 
 def _coerce_list(value: Any) -> list[str]:
@@ -750,12 +752,48 @@ class Repository:
                 """
                 SELECT * FROM drafts
                 WHERE x_account_id = ? AND status = 'pending'
-                  AND expires_at IS NOT NULL AND expires_at <= ?
+                  AND expires_at IS NOT NULL AND expires_at < ?
                 ORDER BY created_at
                 """,
                 (x_account_id, now_iso),
             ).fetchall()
         return [_draft_from_row(row) for row in rows]
+
+    def claim_draft_for_expiration(
+        self, x_account_id: int, draft_id: str, cutoff: str
+    ) -> Draft | None:
+        """Claim an overdue draft unless a timely Slack action is still active."""
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE drafts
+                SET status = 'expiring'
+                WHERE x_account_id = ? AND id = ? AND status = 'pending'
+                  AND expires_at IS NOT NULL AND expires_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM slack_action_jobs AS action
+                      WHERE action.x_account_id = ?
+                        AND action.draft_id = ?
+                        AND action.status IN ('pending', 'processing')
+                        AND action.created_at <= drafts.expires_at
+                  )
+                """,
+                (
+                    x_account_id,
+                    str(draft_id),
+                    cutoff,
+                    x_account_id,
+                    str(draft_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM drafts WHERE x_account_id = ? AND id = ?",
+                (x_account_id, str(draft_id)),
+            ).fetchone()
+        return _draft_from_row(row)
 
     def recent_draft_texts(
         self, x_account_id: int, limit: int = 100, exclude_id: str | None = None
@@ -1203,12 +1241,14 @@ class Repository:
         normalized_expected_live = bool(expected_live)
         normalized_reviewer = str(reviewer)
         with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             draft = conn.execute(
                 "SELECT id FROM drafts WHERE x_account_id = ? AND id = ?",
                 (normalized_account_id, normalized_draft_id),
             ).fetchone()
             if draft is None:
                 raise ValueError("Draft does not belong to the X account")
+            created_at = utc_now_iso()
             cursor = conn.execute(
                 """
                 INSERT INTO slack_action_jobs (
@@ -1225,7 +1265,7 @@ class Repository:
                     action_id,
                     int(normalized_expected_live),
                     normalized_reviewer,
-                    utc_now_iso(),
+                    created_at,
                 ),
             )
             created = cursor.rowcount == 1
@@ -1236,17 +1276,49 @@ class Repository:
                 """,
                 (normalized_account_id, idempotency_key),
             ).fetchone()
-        if row is None:
-            raise ValueError("Slack action idempotency key conflicts with another account")
-        job = _slack_action_from_row(row)
-        if (
-            job.connection_id != normalized_connection_id
-            or job.draft_id != normalized_draft_id
-            or job.action_id != action_id
-            or job.expected_live != normalized_expected_live
-            or job.reviewer != normalized_reviewer
-        ):
-            raise ValueError("Slack action idempotency key conflicts with a different request")
+            if row is None:
+                raise ValueError(
+                    "Slack action idempotency key conflicts with another account"
+                )
+            job = _slack_action_from_row(row)
+            if (
+                job.connection_id != normalized_connection_id
+                or job.draft_id != normalized_draft_id
+                or job.action_id != action_id
+                or job.expected_live != normalized_expected_live
+                or job.reviewer != normalized_reviewer
+            ):
+                raise ValueError(
+                    "Slack action idempotency key conflicts with a different request"
+                )
+            event_type = (
+                "slack_action_received" if created else "slack_action_duplicate"
+            )
+            if created:
+                self._log_slack_action_event(
+                    conn,
+                    event_type,
+                    row,
+                    result_status="pending",
+                    provider="",
+                )
+            else:
+                try:
+                    self._log_slack_action_event(
+                        conn,
+                        event_type,
+                        row,
+                        result_status=job.status,
+                        provider="",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Slack duplicate audit event failed: account=%s job=%s "
+                        "error=%s",
+                        job.x_account_id,
+                        job.id,
+                        type(exc).__name__,
+                    )
         return job, created
 
     def get_slack_action_job(

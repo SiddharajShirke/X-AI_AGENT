@@ -82,6 +82,8 @@ Live publication needs all of the following:
 
 If either live switch is off, approval intentionally uses the dry-run publisher. If both are on but credentials are missing or locked, publication becomes visibly `failed`; it never silently falls back to dry-run. A failed publication can be retried only with a separate explicit Retry action.
 
+`APP_MODE` describes deployment intent and controls safety warnings; it is not a publication gate. `BUFFER_LIVE_POSTING=true` plus an account's LIVE switch can publish even when `APP_MODE=demo`, so that mismatch is displayed and warned prominently.
+
 The prototype handles text-only posts. Media, threads, analytics reconciliation, OAuth onboarding, and background retry queues are out of scope.
 
 ## Optional generation and research

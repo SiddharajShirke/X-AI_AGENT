@@ -60,6 +60,8 @@ The changing ngrok origin is appropriate for local testing only. Update Slack ev
 
 Keep `APP_MODE=demo`, `BUFFER_LIVE_POSTING=false`, and the per-account live switch off until the staged checks are complete. Demo mode remains credential-free.
 
+`APP_MODE` is an operator-facing deployment label, not a publication gate. If `BUFFER_LIVE_POSTING=true`, an account with its LIVE switch enabled can publish even while `APP_MODE=demo`; startup and dashboard warnings call out that mismatch. Set the Buffer switch back to `false` to remove live capability.
+
 ## Connection setup
 
 Credentials are entered through `/connections`, encrypted before SQLite storage, and reused from each account's Setup page. They do not belong in `.env`. Changing `APP_ENCRYPTION_KEY` makes existing records visibly locked; replace each connection using the original key or new credentials.

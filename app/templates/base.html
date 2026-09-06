@@ -22,7 +22,7 @@
         </select>
       </label>
       {% endif %}
-      <span class="mode-pill">{{ settings.app_mode|upper }}</span>
+      <span class="mode-pill">APP {{ settings.app_mode|upper }} · BUFFER {{ "LIVE ENABLED" if settings.buffer_live_posting else "OFF" }}</span>
     </div>
   </header>
   <nav class="tabs" aria-label="Primary navigation">
@@ -34,6 +34,7 @@
     <a href="/connections{% if account %}?account_id={{ account.id }}{% endif %}">Connections</a>
   </nav>
   <main>
+    {% if settings.demo_mode and settings.buffer_live_posting %}<div class="alert warning">Mode mismatch: APP_MODE=demo does not disable Buffer publication. {% if account and account.live_posting_enabled %}This account is LIVE because its account switch is also enabled.{% else %}Any account with its LIVE switch enabled can publish.{% endif %}</div>{% endif %}
     {% if message %}<div class="flash" role="status">{{ message }}</div>{% endif %}
     {% block content %}{% endblock %}
   </main>

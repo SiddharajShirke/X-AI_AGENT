@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, HTTPException, Request
@@ -10,6 +11,7 @@ from app.services.integrations import IntegrationError
 
 
 router = APIRouter(tags=["slack"])
+_SLACK_USER_ID = re.compile(r"[A-Z0-9]{2,32}")
 
 
 @router.post("/integrations/slack/{connection_id}/actions")
@@ -38,7 +40,10 @@ async def slack_action(connection_id: int, request: Request):
         x_account_id = int(value["x_account_id"])
         draft_id = str(value["draft_id"])
         user = payload["user"]
-        reviewer = f"slack:{user['id']}:{user.get('name', '')}"
+        user_id = user["id"]
+        if not isinstance(user_id, str) or not _SLACK_USER_ID.fullmatch(user_id):
+            raise ValueError("Invalid Slack user identifier")
+        reviewer = f"slack:{user_id}"
     except (KeyError, IndexError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail="Malformed Slack action payload") from exc
 
@@ -75,7 +80,7 @@ async def slack_action(connection_id: int, request: Request):
     idempotency_key = hashlib.sha256(
         f"{connection_id}:".encode() + body
     ).hexdigest()
-    job, created = repository.enqueue_slack_action(
+    job, _ = repository.enqueue_slack_action(
         idempotency_key=idempotency_key,
         connection_id=connection_id,
         x_account_id=x_account_id,
@@ -83,12 +88,6 @@ async def slack_action(connection_id: int, request: Request):
         action_id=action_id,
         expected_live=expected_live,
         reviewer=reviewer,
-    )
-    repository.log_event(
-        x_account_id,
-        "slack_action_received" if created else "slack_action_duplicate",
-        draft_id,
-        {"job_id": job.id, "action_id": action_id},
     )
     request.app.state.services.slack_actions.wake()
 

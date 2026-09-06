@@ -8,6 +8,7 @@
 - Buffer and Slack credentials are Fernet-encrypted with `APP_ENCRYPTION_KEY`; UI/API responses show only a configured mask.
 - Publication has an atomic claim, so repeated or overlapping approvals produce one publisher call.
 - Global and per-account live switches default off. Missing credentials in live mode are failures, not dry-run success.
+- `APP_MODE` does not gate publication. A demo/Buffer-live mismatch is warned and shown because the global Buffer switch plus an account LIVE switch remains publication-capable.
 - The deprecated compatibility setting `X_LIVE_POSTING` remains false and cannot enable publishing; `BUFFER_LIVE_POSTING` is the effective global gate.
 - Safety is checked again immediately before approval/retry. Silence is never approval.
 
